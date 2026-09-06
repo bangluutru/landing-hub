@@ -1,19 +1,32 @@
 /**
  * AIWF LP SDK — AI Workforce Landing Page SDK
  * Lightweight, zero-dependency client library for landing pages
- * Version 1.0.0
+ * Version 1.1.0 — Production Hardened
  */
 
 export interface LPHubConfig {
   projectId: string;
   landingPageId: string;
-  apiUrl: string;
+  apiUrl?: string;
   debug?: boolean;
   autoPageView?: boolean;
 }
 
+export interface AttributionTouch {
+  utmSource?: string;
+  utmMedium?: string;
+  utmCampaign?: string;
+  utmContent?: string;
+  utmTerm?: string;
+  referrer?: string;
+  landingUrl?: string;
+  timestamp?: string;
+}
+
 export interface LeadSubmissionPayload {
   formId: string;
+  submissionId?: string;
+  idempotencyKey?: string;
   name?: string;
   phone?: string;
   email?: string;
@@ -38,6 +51,8 @@ export interface OrderItem {
 
 export interface OrderSubmissionPayload {
   formId: string;
+  submissionId?: string;
+  idempotencyKey?: string;
   customer: OrderCustomer;
   items: OrderItem[];
   subtotal?: number;
@@ -49,6 +64,8 @@ export interface OrderSubmissionPayload {
 
 export interface CustomFormPayload {
   formId: string;
+  submissionId?: string;
+  idempotencyKey?: string;
   data: Record<string, any>;
 }
 
@@ -67,6 +84,8 @@ class LPHubClient {
   private config: LPHubConfig | null = null;
   private visitorId: string = '';
   private sessionId: string = '';
+  private firstTouch: AttributionTouch | null = null;
+  private lastTouch: AttributionTouch | null = null;
 
   constructor() {
     this.initStorage();
@@ -75,7 +94,7 @@ class LPHubClient {
   private initStorage() {
     if (typeof window === 'undefined') return;
 
-    // Visitor ID (Persistent in localStorage)
+    // 1. Visitor ID (Persistent in localStorage)
     try {
       let vid = localStorage.getItem('_lphub_vid');
       if (!vid) {
@@ -87,7 +106,7 @@ class LPHubClient {
       this.visitorId = 'v_anon_' + Math.random().toString(36).substring(2, 9);
     }
 
-    // Session ID (Per-session in sessionStorage)
+    // 2. Session ID (Per-session in sessionStorage)
     try {
       let sid = sessionStorage.getItem('_lphub_sid');
       if (!sid) {
@@ -98,14 +117,90 @@ class LPHubClient {
     } catch {
       this.sessionId = 's_anon_' + Math.random().toString(36).substring(2, 9);
     }
+
+    // 3. Attribution Persistence (firstTouch and lastTouch)
+    this.syncAttribution();
+  }
+
+  private syncAttribution() {
+    if (typeof window === 'undefined') return;
+
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      const utmSource = urlParams.get('utm_source') || undefined;
+      const utmMedium = urlParams.get('utm_medium') || undefined;
+      const utmCampaign = urlParams.get('utm_campaign') || undefined;
+      const utmContent = urlParams.get('utm_content') || undefined;
+      const utmTerm = urlParams.get('utm_term') || undefined;
+      const referrer = document.referrer || undefined;
+
+      const hasUtm = Boolean(utmSource || utmMedium || utmCampaign || utmContent || utmTerm);
+
+      // Load existing touches
+      const storedFt = localStorage.getItem('_lphub_ft');
+      if (storedFt) {
+        try {
+          this.firstTouch = JSON.parse(storedFt);
+        } catch {}
+      }
+
+      const storedLt = localStorage.getItem('_lphub_lt');
+      if (storedLt) {
+        try {
+          this.lastTouch = JSON.parse(storedLt);
+        } catch {}
+      }
+
+      // Record first touch if not present
+      if (!this.firstTouch) {
+        this.firstTouch = {
+          utmSource,
+          utmMedium,
+          utmCampaign,
+          utmContent,
+          utmTerm,
+          referrer,
+          landingUrl: window.location.href,
+          timestamp: new Date().toISOString()
+        };
+        localStorage.setItem('_lphub_ft', JSON.stringify(this.firstTouch));
+      }
+
+      // Record last touch if current URL has new campaign UTMs
+      if (hasUtm) {
+        this.lastTouch = {
+          utmSource,
+          utmMedium,
+          utmCampaign,
+          utmContent,
+          utmTerm,
+          referrer,
+          landingUrl: window.location.href,
+          timestamp: new Date().toISOString()
+        };
+        localStorage.setItem('_lphub_lt', JSON.stringify(this.lastTouch));
+      }
+    } catch (e) {
+      // Ignore localStorage exceptions in restrictive browser modes
+    }
   }
 
   public init(config: LPHubConfig) {
+    // Default API endpoint mechanism: if apiUrl is omitted, resolve from window global or current origin
+    let resolvedApiUrl = config.apiUrl;
+    if (!resolvedApiUrl) {
+      if (typeof window !== 'undefined') {
+        resolvedApiUrl = (window as any).__LPHUB_API_URL__ || window.location.origin;
+      } else {
+        resolvedApiUrl = '';
+      }
+    }
+
     this.config = {
       debug: false,
       autoPageView: true,
       ...config,
-      apiUrl: config.apiUrl.replace(/\/+$/, '') // strip trailing slash
+      apiUrl: resolvedApiUrl.replace(/\/+$/, '')
     };
 
     if (this.config.debug) {
@@ -113,30 +208,43 @@ class LPHubClient {
     }
 
     if (this.config.autoPageView) {
-      this.track('page_view', { title: document.title });
+      this.track('page_view', { title: typeof document !== 'undefined' ? document.title : '' });
     }
+  }
+
+  private generateIdempotencyKey(prefix = 'ik'): string {
+    return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 9)}`;
   }
 
   private getUtmAndContext() {
     if (typeof window === 'undefined') return {};
 
     const urlParams = new URLSearchParams(window.location.search);
+    const activeUtmSource = urlParams.get('utm_source') || this.lastTouch?.utmSource || this.firstTouch?.utmSource;
+    const activeUtmMedium = urlParams.get('utm_medium') || this.lastTouch?.utmMedium || this.firstTouch?.utmMedium;
+    const activeUtmCampaign = urlParams.get('utm_campaign') || this.lastTouch?.utmCampaign || this.firstTouch?.utmCampaign;
+    const activeUtmContent = urlParams.get('utm_content') || this.lastTouch?.utmContent || this.firstTouch?.utmContent;
+    const activeUtmTerm = urlParams.get('utm_term') || this.lastTouch?.utmTerm || this.firstTouch?.utmTerm;
+    const activeReferrer = document.referrer || this.lastTouch?.referrer || this.firstTouch?.referrer;
+
     return {
-      utmSource: urlParams.get('utm_source') || undefined,
-      utmMedium: urlParams.get('utm_medium') || undefined,
-      utmCampaign: urlParams.get('utm_campaign') || undefined,
-      utmContent: urlParams.get('utm_content') || undefined,
-      utmTerm: urlParams.get('utm_term') || undefined,
-      referrer: document.referrer || undefined,
+      utmSource: activeUtmSource || undefined,
+      utmMedium: activeUtmMedium || undefined,
+      utmCampaign: activeUtmCampaign || undefined,
+      utmContent: activeUtmContent || undefined,
+      utmTerm: activeUtmTerm || undefined,
+      referrer: activeReferrer || undefined,
       pageUrl: window.location.href,
       visitorId: this.visitorId,
       sessionId: this.sessionId,
+      firstTouch: this.firstTouch || undefined,
+      lastTouch: this.lastTouch || undefined
     };
   }
 
   private ensureConfigured(): LPHubConfig {
     if (!this.config) {
-      throw new Error('[LPHub SDK] Client not initialized. Call LPHub.init({ projectId, landingPageId, apiUrl }) first.');
+      throw new Error('[LPHub SDK] Client not initialized. Call LPHub.init({ projectId, landingPageId }) first.');
     }
     return this.config;
   }
@@ -158,7 +266,9 @@ class LPHubClient {
       utmTerm: context.utmTerm,
       referrer: context.referrer,
       pageUrl: context.pageUrl,
-      metadata: metadata || {},
+      firstTouch: context.firstTouch,
+      lastTouch: context.lastTouch,
+      metadata: metadata || {}
     };
 
     return this.postJson('/api/track', payload);
@@ -168,21 +278,23 @@ class LPHubClient {
     const config = this.ensureConfigured();
     const context = this.getUtmAndContext();
 
-    // Extract name/phone/email from top level or data payload
     const data = payload.data || {};
     const name = payload.name || data.name || data.fullname || data.fullName;
     const phone = payload.phone || data.phone || data.phoneNumber;
     const email = payload.email || data.email;
+    const idempKey = payload.idempotencyKey || payload.submissionId || this.generateIdempotencyKey('lead');
 
     const requestBody = {
       projectId: config.projectId,
       landingPageId: config.landingPageId,
       formId: payload.formId,
+      submissionId: idempKey,
+      idempotencyKey: idempKey,
       name,
       phone,
       email,
       data,
-      ...context,
+      ...context
     };
 
     return this.postJson('/api/lead', requestBody);
@@ -192,10 +304,14 @@ class LPHubClient {
     const config = this.ensureConfigured();
     const context = this.getUtmAndContext();
 
+    const idempKey = payload.idempotencyKey || payload.submissionId || this.generateIdempotencyKey('ord');
+
     const requestBody = {
       projectId: config.projectId,
       landingPageId: config.landingPageId,
       formId: payload.formId,
+      submissionId: idempKey,
+      idempotencyKey: idempKey,
       customer: payload.customer,
       items: payload.items,
       subtotal: payload.subtotal ?? payload.total,
@@ -203,7 +319,7 @@ class LPHubClient {
       currency: payload.currency || 'VND',
       paymentMethod: payload.paymentMethod || 'cod',
       data: payload.data || {},
-      ...context,
+      ...context
     };
 
     return this.postJson('/api/order', requestBody);
@@ -213,12 +329,16 @@ class LPHubClient {
     const config = this.ensureConfigured();
     const context = this.getUtmAndContext();
 
+    const idempKey = payload.idempotencyKey || payload.submissionId || this.generateIdempotencyKey('csub');
+
     const requestBody = {
       projectId: config.projectId,
       landingPageId: config.landingPageId,
       formId: payload.formId,
+      submissionId: idempKey,
+      idempotencyKey: idempKey,
       data: payload.data,
-      ...context,
+      ...context
     };
 
     return this.postJson('/api/custom-form', requestBody);
@@ -237,9 +357,9 @@ class LPHubClient {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Accept': 'application/json',
+          'Accept': 'application/json'
         },
-        body: JSON.stringify(data),
+        body: JSON.stringify(data)
       });
 
       const json = await response.json();
@@ -253,8 +373,8 @@ class LPHubClient {
         success: false,
         error: {
           code: 'NETWORK_ERROR',
-          message: err.message || 'Failed to reach Landing Hub API',
-        },
+          message: err.message || 'Failed to reach Landing Hub API'
+        }
       };
     }
   }
@@ -265,6 +385,13 @@ class LPHubClient {
 
   public getSessionId(): string {
     return this.sessionId;
+  }
+
+  public getAttribution() {
+    return {
+      firstTouch: this.firstTouch,
+      lastTouch: this.lastTouch
+    };
   }
 }
 

@@ -15,43 +15,57 @@ service cloud.firestore {
       return isAuthenticated() && (getUserRole() == 'super_admin' || request.auth.token.admin == true);
     }
 
+    function isProjectAdmin() {
+      return isAuthenticated() && getUserRole() == 'project_admin';
+    }
+
+    function isViewer() {
+      return isAuthenticated() && getUserRole() == 'viewer';
+    }
+
+    function hasProjectScope(projectId) {
+      return isSuperAdmin() || (isProjectAdmin() && request.auth.token.projectIds != null && projectId in request.auth.token.projectIds);
+    }
+
     // STRICT ARCHITECTURAL PRINCIPLE:
     // Anonymous public landing pages CANNOT write directly to Firestore!
     // External writes MUST go through Landing Hub's Ingestion API Server (Firebase Admin SDK).
     
     match /projects/{projectId} {
-      allow read: if isAuthenticated();
+      allow read: if isAuthenticated() && (isSuperAdmin() || isViewer() || hasProjectScope(projectId));
       allow write: if isSuperAdmin();
     }
     
     match /landingPages/{lpId} {
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated();
+      allow read: if isAuthenticated() && (isSuperAdmin() || isViewer() || hasProjectScope(resource.data.projectId));
+      allow create: if isAuthenticated() && hasProjectScope(request.resource.data.projectId);
+      allow update, delete: if isAuthenticated() && hasProjectScope(resource.data.projectId);
     }
     
     match /forms/{formId} {
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated();
+      allow read: if isAuthenticated() && (isSuperAdmin() || isViewer() || hasProjectScope(resource.data.projectId));
+      allow create: if isAuthenticated() && hasProjectScope(request.resource.data.projectId);
+      allow update, delete: if isAuthenticated() && hasProjectScope(resource.data.projectId);
     }
     
     match /leads/{leadId} {
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated();
+      allow read: if isAuthenticated() && (isSuperAdmin() || isViewer() || hasProjectScope(resource.data.projectId));
+      allow write: if isAuthenticated() && hasProjectScope(resource.data.projectId);
     }
     
     match /orders/{orderId} {
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated();
+      allow read: if isAuthenticated() && (isSuperAdmin() || isViewer() || hasProjectScope(resource.data.projectId));
+      allow write: if isAuthenticated() && hasProjectScope(resource.data.projectId);
     }
     
     match /customSubmissions/{submissionId} {
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated();
+      allow read: if isAuthenticated() && (isSuperAdmin() || isViewer() || hasProjectScope(resource.data.projectId));
+      allow write: if isAuthenticated() && hasProjectScope(resource.data.projectId);
     }
     
     match /events/{eventId} {
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated();
+      allow read: if isAuthenticated() && (isSuperAdmin() || isViewer() || hasProjectScope(resource.data.projectId));
+      allow write: if isSuperAdmin();
     }
     
     match /users/{userId} {

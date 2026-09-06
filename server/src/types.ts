@@ -112,14 +112,14 @@ export interface Order {
   formId: string;
   customer: OrderCustomer;
   items: OrderItem[];
-  // Order integrity & verification fields
-  clientReportedSubtotal?: number;
-  clientReportedTotal?: number;
-  serverCalculatedSubtotal?: number;
-  serverCalculatedTotal?: number;
-  verifiedRevenue?: boolean;
-  subtotal: number;
-  total: number;
+  // Order Integrity & Verification
+  clientReportedSubtotal: number;
+  clientReportedTotal: number;
+  serverCalculatedSubtotal: number;
+  serverCalculatedTotal: number;
+  verifiedRevenue: boolean; // false in V1 since client-reported prices are not verified against product catalog
+  subtotal: number; // backward compatibility
+  total: number;    // backward compatibility
   currency: string;
   paymentMethod: string;
   paymentStatus: PaymentStatus;
@@ -185,6 +185,8 @@ export interface TrackingEvent {
   utmTerm?: string;
   referrer?: string;
   pageUrl?: string;
+  firstTouch?: AttributionTouch;
+  lastTouch?: AttributionTouch;
   timestamp: string;
 }
 

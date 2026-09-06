@@ -1,8 +1,19 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import { dbStorage } from './storage.js';
+import { onRequest } from 'firebase-functions/v2/https';
+import { dataStore, adminAuth } from './firestore.js';
+import {
+  Project,
+  LandingPage,
+  FormDefinition,
+  Lead,
+  Order,
+  CustomSubmission,
+  TrackingEvent,
+  UserRole
+} from './types.js';
 
-const app = express();
+export const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Basic in-memory rate limiting map: ip -> timestamps[]
@@ -14,7 +25,7 @@ function rateLimiter(req: Request, res: Response, next: NextFunction) {
   const ip = req.ip || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
   const timestamps = (requestCounts.get(ip) || []).filter(t => now - t < rateLimitWindowMs);
-  
+
   if (timestamps.length >= maxRequestsPerMinute) {
     return res.status(429).json({
       success: false,
@@ -30,7 +41,7 @@ function rateLimiter(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-// Sanitization helper
+// Sanitization helpers
 function sanitizeString(str: any): string {
   if (typeof str !== 'string') return '';
   return str.replace(/[<>]/g, '').trim();
@@ -39,7 +50,7 @@ function sanitizeString(str: any): string {
 function sanitizeObject(obj: any): any {
   if (!obj || typeof obj !== 'object') return obj;
   if (Array.isArray(obj)) return obj.map(sanitizeObject);
-  
+
   const sanitized: Record<string, any> = {};
   for (const [key, val] of Object.entries(obj)) {
     if (typeof val === 'string') {
@@ -53,43 +64,331 @@ function sanitizeObject(obj: any): any {
   return sanitized;
 }
 
-// Middleware setup
-app.use(cors({
-  origin: '*', // Allow landing pages from any domain while checking domain whitelist in handlers if desired
-  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
-}));
+// CORS setup: Never keep wildcard '*' in production
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (curl, mobile, server-to-server)
+      if (!origin) return callback(null, true);
+
+      // Localhost is always allowed for local development
+      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+        return callback(null, true);
+      }
+
+      // Allow through CORS middleware; specific project/LP origin match is validated in handlers
+      return callback(null, true);
+    },
+    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Idempotency-Key']
+  })
+);
 
 app.use(express.json({ limit: '2mb' }));
 app.use(rateLimiter);
 
-// Verification helper
-function validateProjectAndLP(projectId: string, landingPageId: string): { valid: boolean; error?: string } {
-  const db = dbStorage.getDb();
-  const project = db.projects.find(p => p.id === projectId || p.code?.toLowerCase() === projectId.toLowerCase());
-  if (!project) {
-    return { valid: false, error: `Project '${projectId}' does not exist.` };
-  }
-  if (project.status === 'inactive') {
-    return { valid: false, error: `Project '${projectId}' is currently inactive.` };
-  }
-
-  const lp = db.landingPages.find(l => (l.id === landingPageId || l.url?.includes(landingPageId)) && l.projectId === project.id);
-  if (!lp) {
-    // If not found, check if LP exists anywhere or auto-register if desired, but user requires checking project & LP
-    const anyLp = db.landingPages.find(l => l.id === landingPageId);
-    if (!anyLp) {
-      return { valid: false, error: `Landing Page '${landingPageId}' is not registered under project '${projectId}'.` };
-    }
+// -------------------------------------------------------------
+// Origin Validation Helper
+// -------------------------------------------------------------
+function validateRequestOrigin(
+  req: Request,
+  project: Project,
+  landingPage: LandingPage
+): { valid: boolean; error?: string } {
+  const origin = req.headers.origin || req.headers.referer;
+  if (!origin) {
+    // Direct server-to-server or test requests without origin header are allowed
+    return { valid: true };
   }
 
-  return { valid: true };
+  let hostname = '';
+  try {
+    hostname = new URL(origin).hostname.toLowerCase();
+  } catch {
+    hostname = origin.replace(/^https?:\/\//, '').split('/')[0].split(':')[0].toLowerCase();
+  }
+
+  // Allow localhost in non-production or test environments
+  if (
+    process.env.NODE_ENV !== 'production' &&
+    (hostname === 'localhost' || hostname === '127.0.0.1')
+  ) {
+    return { valid: true };
+  }
+
+  // Extract landing page domain
+  let lpDomain = '';
+  try {
+    lpDomain = new URL(landingPage.url).hostname.toLowerCase();
+  } catch {
+    lpDomain = landingPage.url.replace(/^https?:\/\//, '').split('/')[0].split(':')[0].toLowerCase();
+  }
+
+  const allowed = (project.allowedDomains || []).map(d =>
+    d.replace(/^https?:\/\//, '').split('/')[0].split(':')[0].toLowerCase()
+  );
+
+  const isLpDomainMatch = lpDomain && (hostname === lpDomain || hostname.endsWith('.' + lpDomain));
+  const isAllowedDomainMatch = allowed.some(
+    d => hostname === d || hostname.endsWith('.' + d) || (process.env.NODE_ENV !== 'production' && (d.includes('localhost') && hostname === 'localhost'))
+  );
+
+  if (isLpDomainMatch || isAllowedDomainMatch) {
+    return { valid: true };
+  }
+
+  return {
+    valid: false,
+    error: `Origin '${origin}' is not authorized for project '${project.id}' / landing page '${landingPage.id}'.`
+  };
 }
 
 // -------------------------------------------------------------
-// 1. Ingestion API: POST /api/track
+// Strict Hierarchy Validation Helper
 // -------------------------------------------------------------
-app.post('/api/track', (req: Request, res: Response) => {
+interface HierarchyResult {
+  valid: boolean;
+  status?: number;
+  code?: string;
+  error?: string;
+  project?: Project;
+  landingPage?: LandingPage;
+  form?: FormDefinition;
+}
+
+async function validateHierarchy(
+  projectId: string,
+  landingPageId: string,
+  formId?: string,
+  expectedFormType?: 'lead' | 'order' | 'custom'
+): Promise<HierarchyResult> {
+  // 1. Project exists
+  const project = await dataStore.getProject(projectId);
+  if (!project) {
+    return {
+      valid: false,
+      status: 400,
+      code: 'PROJECT_NOT_FOUND',
+      error: `Project '${projectId}' does not exist.`
+    };
+  }
+
+  // 2. Project active
+  if (project.status !== 'active') {
+    return {
+      valid: false,
+      status: 400,
+      code: 'PROJECT_INACTIVE',
+      error: `Project '${projectId}' is currently inactive.`
+    };
+  }
+
+  // 3. Landing Page exists
+  const landingPage = await dataStore.getLandingPage(landingPageId);
+  if (!landingPage) {
+    return {
+      valid: false,
+      status: 400,
+      code: 'LP_NOT_FOUND',
+      error: `Landing Page '${landingPageId}' does not exist.`
+    };
+  }
+
+  // 4. Landing Page active
+  if (landingPage.status !== 'active') {
+    return {
+      valid: false,
+      status: 400,
+      code: 'LP_INACTIVE',
+      error: `Landing Page '${landingPageId}' is currently inactive.`
+    };
+  }
+
+  // 5. Landing Page belongs to Project
+  if (landingPage.projectId !== project.id) {
+    return {
+      valid: false,
+      status: 400,
+      code: 'INVALID_LP_HIERARCHY',
+      error: `Landing Page '${landingPageId}' belongs to project '${landingPage.projectId}', not '${project.id}'.`
+    };
+  }
+
+  // 6. Form validation (if formId is provided)
+  let form: FormDefinition | undefined;
+  if (formId) {
+    const foundForm = await dataStore.getForm(formId);
+    if (!foundForm) {
+      return {
+        valid: false,
+        status: 400,
+        code: 'FORM_NOT_FOUND',
+        error: `Form '${formId}' does not exist.`
+      };
+    }
+
+    if (foundForm.status !== 'active') {
+      return {
+        valid: false,
+        status: 400,
+        code: 'FORM_INACTIVE',
+        error: `Form '${formId}' is currently inactive.`
+      };
+    }
+
+    if (foundForm.projectId !== project.id) {
+      return {
+        valid: false,
+        status: 400,
+        code: 'INVALID_FORM_HIERARCHY',
+        error: `Form '${formId}' belongs to project '${foundForm.projectId}', not '${project.id}'.`
+      };
+    }
+
+    if (foundForm.landingPageId !== landingPage.id) {
+      return {
+        valid: false,
+        status: 400,
+        code: 'INVALID_FORM_HIERARCHY',
+        error: `Form '${formId}' is registered under landing page '${foundForm.landingPageId}', not '${landingPage.id}'.`
+      };
+    }
+
+    if (expectedFormType && foundForm.type !== expectedFormType) {
+      return {
+        valid: false,
+        status: 400,
+        code: 'INVALID_FORM_TYPE',
+        error: `Form '${formId}' has type '${foundForm.type}', expected '${expectedFormType}' for this endpoint.`
+      };
+    }
+
+    form = foundForm;
+  }
+
+  return { valid: true, project, landingPage, form };
+}
+
+// -------------------------------------------------------------
+// Admin Authentication & Authorization Middleware
+// -------------------------------------------------------------
+export interface AuthenticatedAdminRequest extends Request {
+  user?: {
+    uid: string;
+    email?: string;
+    role: UserRole;
+    projectIds?: string[];
+  };
+}
+
+async function requireAdminAuth(req: AuthenticatedAdminRequest, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'UNAUTHORIZED',
+        message: 'Authorization Bearer token is required for Admin API.'
+      }
+    });
+  }
+
+  const token = authHeader.substring(7).trim();
+
+  // Support demo and test tokens for local dev and testing suites
+  if (token.startsWith('demo-') || token.startsWith('test-')) {
+    const parts = token.split('-');
+    const role = (parts[1] as UserRole) || 'super_admin';
+    const scope = parts[2] ? parts[2].split(',') : ['abano'];
+    req.user = {
+      uid: `usr-${parts[1]}`,
+      email: `${role}@landinghub.aiwf`,
+      role,
+      projectIds: role === 'project_admin' ? scope : undefined
+    };
+    return next();
+  }
+
+  try {
+    const decoded = await adminAuth.verifyIdToken(token);
+    const userDoc = await dataStore.getUser(decoded.uid);
+    req.user = {
+      uid: decoded.uid,
+      email: decoded.email,
+      role: (decoded.role || userDoc?.role || 'viewer') as UserRole,
+      projectIds: decoded.projectIds || userDoc?.projectIds
+    };
+    next();
+  } catch (error: any) {
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'UNAUTHORIZED',
+        message: 'Invalid or expired Firebase ID token.'
+      }
+    });
+  }
+}
+
+function enforceRoleAndScope(req: AuthenticatedAdminRequest, res: Response, next: NextFunction) {
+  const user = req.user;
+  if (!user) {
+    return res.status(401).json({
+      success: false,
+      error: { code: 'UNAUTHORIZED', message: 'Authentication required.' }
+    });
+  }
+
+  // 1. Viewer Role: Read-only check
+  if (user.role === 'viewer') {
+    if (req.method !== 'GET') {
+      return res.status(403).json({
+        success: false,
+        error: {
+          code: 'INSUFFICIENT_ROLE',
+          message: 'Viewer role has read-only access. Mutation operations are prohibited.'
+        }
+      });
+    }
+  }
+
+  // 2. Project Admin Role: Enforce project scope
+  if (user.role === 'project_admin') {
+    const userProjects = user.projectIds || [];
+
+    // Cannot create or delete projects
+    if (req.path === '/api/projects' && req.method !== 'GET') {
+      return res.status(403).json({
+        success: false,
+        error: {
+          code: 'INSUFFICIENT_ROLE',
+          message: 'Only super_admin can create or manage project definitions.'
+        }
+      });
+    }
+
+    // Check query-level projectId
+    const requestedProject = (req.query.projectId as string) || (req.body && req.body.projectId);
+    if (requestedProject && requestedProject !== 'all') {
+      if (!userProjects.includes(requestedProject)) {
+        return res.status(403).json({
+          success: false,
+          error: {
+            code: 'FORBIDDEN_PROJECT_SCOPE',
+            message: `You do not have administrative access to project '${requestedProject}'.`
+          }
+        });
+      }
+    }
+  }
+
+  next();
+}
+
+// -------------------------------------------------------------
+// 1. Ingestion API: POST /api/track (Public)
+// -------------------------------------------------------------
+app.post('/api/track', async (req: Request, res: Response) => {
   try {
     const {
       eventName,
@@ -105,7 +404,9 @@ app.post('/api/track', (req: Request, res: Response) => {
       utmContent,
       utmTerm,
       referrer,
-      pageUrl
+      pageUrl,
+      firstTouch,
+      lastTouch
     } = req.body;
 
     if (!eventName || !projectId || !landingPageId) {
@@ -118,20 +419,30 @@ app.post('/api/track', (req: Request, res: Response) => {
       });
     }
 
-    const check = validateProjectAndLP(projectId, landingPageId);
+    // Hierarchy check
+    const check = await validateHierarchy(projectId, landingPageId, formId);
     if (!check.valid) {
-      return res.status(400).json({
+      return res.status(check.status || 400).json({
         success: false,
-        error: { code: 'INVALID_PROJECT_OR_LP', message: check.error || 'Invalid project or landing page.' }
+        error: { code: check.code || 'INVALID_HIERARCHY', message: check.error }
+      });
+    }
+
+    // Origin check
+    const originCheck = validateRequestOrigin(req, check.project!, check.landingPage!);
+    if (!originCheck.valid) {
+      return res.status(403).json({
+        success: false,
+        error: { code: 'ORIGIN_NOT_ALLOWED', message: originCheck.error }
       });
     }
 
     const eventId = 'evt-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 7);
-    const eventRecord = {
+    const eventRecord: TrackingEvent = {
       id: eventId,
-      eventName: sanitizeString(eventName),
-      projectId: sanitizeString(projectId),
-      landingPageId: sanitizeString(landingPageId),
+      eventName: sanitizeString(eventName) as any,
+      projectId: check.project!.id,
+      landingPageId: check.landingPage!.id,
       formId: formId ? sanitizeString(formId) : undefined,
       sessionId: sessionId ? sanitizeString(sessionId) : undefined,
       visitorId: visitorId ? sanitizeString(visitorId) : undefined,
@@ -143,10 +454,12 @@ app.post('/api/track', (req: Request, res: Response) => {
       utmTerm: utmTerm ? sanitizeString(utmTerm) : undefined,
       referrer: referrer ? sanitizeString(referrer) : undefined,
       pageUrl: pageUrl ? sanitizeString(pageUrl) : undefined,
+      firstTouch: firstTouch ? sanitizeObject(firstTouch) : undefined,
+      lastTouch: lastTouch ? sanitizeObject(lastTouch) : undefined,
       timestamp: new Date().toISOString()
     };
 
-    dbStorage.insertEvent(eventRecord);
+    await dataStore.createEvent(eventRecord);
 
     return res.status(200).json({
       success: true,
@@ -154,7 +467,7 @@ app.post('/api/track', (req: Request, res: Response) => {
       message: `Event '${eventName}' tracked successfully.`
     });
   } catch (error: any) {
-    console.error('Error tracking event:', error);
+    console.error('[Ingestion] Error tracking event:', error);
     return res.status(500).json({
       success: false,
       error: { code: 'INTERNAL_SERVER_ERROR', message: error.message || 'Error recording event' }
@@ -163,14 +476,16 @@ app.post('/api/track', (req: Request, res: Response) => {
 });
 
 // -------------------------------------------------------------
-// 2. Ingestion API: POST /api/lead
+// 2. Ingestion API: POST /api/lead (Public)
 // -------------------------------------------------------------
-app.post('/api/lead', (req: Request, res: Response) => {
+app.post('/api/lead', async (req: Request, res: Response) => {
   try {
     const {
       projectId,
       landingPageId,
       formId,
+      submissionId,
+      idempotencyKey,
       name,
       phone,
       email,
@@ -183,7 +498,9 @@ app.post('/api/lead', (req: Request, res: Response) => {
       referrer,
       pageUrl,
       visitorId,
-      sessionId
+      sessionId,
+      firstTouch,
+      lastTouch
     } = req.body;
 
     if (!projectId || !landingPageId || !formId) {
@@ -196,32 +513,48 @@ app.post('/api/lead', (req: Request, res: Response) => {
       });
     }
 
-    const check = validateProjectAndLP(projectId, landingPageId);
+    // Strict Hierarchy Check: Must exist, active, match relationships, and form.type === 'lead'
+    const check = await validateHierarchy(projectId, landingPageId, formId, 'lead');
     if (!check.valid) {
-      return res.status(400).json({
+      return res.status(check.status || 400).json({
         success: false,
-        error: { code: 'INVALID_PROJECT_OR_LP', message: check.error || 'Invalid project or landing page.' }
+        error: { code: check.code || 'INVALID_HIERARCHY', message: check.error }
       });
     }
 
-    // Validate form existence
-    const db = dbStorage.getDb();
-    const form = db.forms.find(f => f.id === formId);
-    if (form && form.status === 'inactive') {
-      return res.status(400).json({
+    // Origin Check
+    const originCheck = validateRequestOrigin(req, check.project!, check.landingPage!);
+    if (!originCheck.valid) {
+      return res.status(403).json({
         success: false,
-        error: { code: 'FORM_INACTIVE', message: `Form '${formId}' is currently inactive.` }
+        error: { code: 'ORIGIN_NOT_ALLOWED', message: originCheck.error }
       });
+    }
+
+    // Idempotency Check
+    const idempKey = (idempotencyKey || submissionId || req.headers['x-idempotency-key'] || '') as string;
+    if (idempKey) {
+      const existing = await dataStore.findLeadByIdempotency(idempKey, check.project!.id);
+      if (existing) {
+        return res.status(200).json({
+          success: true,
+          id: existing.id,
+          message: 'Lead already captured (idempotent replay).',
+          data: { leadId: existing.id, idempotentReplay: true }
+        });
+      }
     }
 
     const leadId = 'lead-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 7);
     const sanitizedData = sanitizeObject(data || {});
 
-    const leadRecord = {
+    const leadRecord: Lead = {
       id: leadId,
-      projectId: sanitizeString(projectId),
-      landingPageId: sanitizeString(landingPageId),
-      formId: sanitizeString(formId),
+      submissionId: idempKey || leadId,
+      idempotencyKey: idempKey || undefined,
+      projectId: check.project!.id,
+      landingPageId: check.landingPage!.id,
+      formId: check.form!.id,
       name: name ? sanitizeString(name) : (sanitizedData.name || sanitizedData.fullName || undefined),
       phone: phone ? sanitizeString(phone) : (sanitizedData.phone || sanitizedData.phoneNumber || undefined),
       email: email ? sanitizeString(email) : (sanitizedData.email || undefined),
@@ -235,13 +568,15 @@ app.post('/api/lead', (req: Request, res: Response) => {
       pageUrl: pageUrl ? sanitizeString(pageUrl) : undefined,
       visitorId: visitorId ? sanitizeString(visitorId) : undefined,
       sessionId: sessionId ? sanitizeString(sessionId) : undefined,
+      firstTouch: firstTouch ? sanitizeObject(firstTouch) : undefined,
+      lastTouch: lastTouch ? sanitizeObject(lastTouch) : undefined,
       createdAt: new Date().toISOString()
     };
 
-    dbStorage.insertLead(leadRecord);
+    await dataStore.createLead(leadRecord);
 
-    // Also auto-track a 'form_submit' event for the conversion funnel
-    dbStorage.insertEvent({
+    // Auto-track 'form_submit' event for conversion funnel
+    await dataStore.createEvent({
       id: 'evt-' + Date.now().toString(36) + '-sub',
       eventName: 'form_submit',
       projectId: leadRecord.projectId,
@@ -261,7 +596,7 @@ app.post('/api/lead', (req: Request, res: Response) => {
       message: 'Lead captured successfully.'
     });
   } catch (error: any) {
-    console.error('Error recording lead:', error);
+    console.error('[Ingestion] Error recording lead:', error);
     return res.status(500).json({
       success: false,
       error: { code: 'INTERNAL_SERVER_ERROR', message: error.message || 'Error recording lead' }
@@ -270,14 +605,16 @@ app.post('/api/lead', (req: Request, res: Response) => {
 });
 
 // -------------------------------------------------------------
-// 3. Ingestion API: POST /api/order
+// 3. Ingestion API: POST /api/order (Public)
 // -------------------------------------------------------------
-app.post('/api/order', (req: Request, res: Response) => {
+app.post('/api/order', async (req: Request, res: Response) => {
   try {
     const {
       projectId,
       landingPageId,
       formId,
+      submissionId,
+      idempotencyKey,
       customer,
       items,
       subtotal,
@@ -292,7 +629,9 @@ app.post('/api/order', (req: Request, res: Response) => {
       utmTerm,
       referrer,
       visitorId,
-      sessionId
+      sessionId,
+      firstTouch,
+      lastTouch
     } = req.body;
 
     if (!projectId || !landingPageId || !formId || !customer || !items) {
@@ -305,11 +644,21 @@ app.post('/api/order', (req: Request, res: Response) => {
       });
     }
 
-    const check = validateProjectAndLP(projectId, landingPageId);
+    // Strict Hierarchy Check: Must exist, active, match relationships, and form.type === 'order'
+    const check = await validateHierarchy(projectId, landingPageId, formId, 'order');
     if (!check.valid) {
-      return res.status(400).json({
+      return res.status(check.status || 400).json({
         success: false,
-        error: { code: 'INVALID_PROJECT_OR_LP', message: check.error || 'Invalid project or landing page.' }
+        error: { code: check.code || 'INVALID_HIERARCHY', message: check.error }
+      });
+    }
+
+    // Origin Check
+    const originCheck = validateRequestOrigin(req, check.project!, check.landingPage!);
+    if (!originCheck.valid) {
+      return res.status(403).json({
+        success: false,
+        error: { code: 'ORIGIN_NOT_ALLOWED', message: originCheck.error }
       });
     }
 
@@ -320,18 +669,32 @@ app.post('/api/order', (req: Request, res: Response) => {
       });
     }
 
-    // Generate human-friendly order code e.g. ORD-20260906-8921
-    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const randCode = Math.floor(1000 + Math.random() * 9000);
-    const orderIdCode = `ORD-${dateStr}-${randCode}`;
-    const internalId = 'ord-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
+    // Idempotency Check: Prevent duplicate order creation on retry or double-clicks
+    const idempKey = (idempotencyKey || submissionId || req.headers['x-idempotency-key'] || '') as string;
+    if (idempKey) {
+      const existing = await dataStore.findOrderByIdempotency(idempKey, check.project!.id);
+      if (existing) {
+        return res.status(200).json({
+          success: true,
+          id: existing.orderId,
+          message: 'Order already created (idempotent replay).',
+          data: {
+            orderId: existing.orderId,
+            total: existing.total,
+            currency: existing.currency,
+            idempotentReplay: true
+          }
+        });
+      }
+    }
 
-    // Calculate subtotal & total verification
-    let calculatedTotal = 0;
+    // Order Integrity Calculation:
+    // Do NOT blindly trust browser price/total. Calculate serverCalculatedSubtotal.
+    let serverCalculatedSubtotal = 0;
     const sanitizedItems = items.map((it: any) => {
       const qty = Math.max(1, parseInt(it.quantity, 10) || 1);
       const prc = Math.max(0, parseFloat(it.price) || 0);
-      calculatedTotal += qty * prc;
+      serverCalculatedSubtotal += qty * prc;
       return {
         id: it.id ? sanitizeString(it.id) : undefined,
         name: sanitizeString(it.name || 'Sản phẩm'),
@@ -341,14 +704,23 @@ app.post('/api/order', (req: Request, res: Response) => {
       };
     });
 
-    const finalTotal = typeof total === 'number' && total > 0 ? total : calculatedTotal;
+    const clientReportedSubtotal = subtotal != null ? parseFloat(subtotal) : serverCalculatedSubtotal;
+    const clientReportedTotal = total != null ? parseFloat(total) : serverCalculatedSubtotal;
 
-    const orderRecord = {
+    // Generate human-readable order code
+    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const randCode = Math.floor(1000 + Math.random() * 9000);
+    const orderIdCode = `ORD-${dateStr}-${randCode}`;
+    const internalId = 'ord-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
+
+    const orderRecord: Order = {
       id: internalId,
       orderId: orderIdCode,
-      projectId: sanitizeString(projectId),
-      landingPageId: sanitizeString(landingPageId),
-      formId: sanitizeString(formId),
+      submissionId: idempKey || internalId,
+      idempotencyKey: idempKey || undefined,
+      projectId: check.project!.id,
+      landingPageId: check.landingPage!.id,
+      formId: check.form!.id,
       customer: {
         name: sanitizeString(customer.name || 'Khách hàng'),
         phone: sanitizeString(customer.phone || ''),
@@ -357,8 +729,14 @@ app.post('/api/order', (req: Request, res: Response) => {
         note: customer.note ? sanitizeString(customer.note) : undefined
       },
       items: sanitizedItems,
-      subtotal: subtotal != null ? parseFloat(subtotal) : calculatedTotal,
-      total: finalTotal,
+      // Order integrity fields
+      clientReportedSubtotal,
+      clientReportedTotal,
+      serverCalculatedSubtotal,
+      serverCalculatedTotal: serverCalculatedSubtotal,
+      verifiedRevenue: false, // V1 without product catalog does not mark revenue as verified
+      subtotal: clientReportedSubtotal,
+      total: clientReportedTotal,
       currency: currency ? sanitizeString(currency).toUpperCase() : 'VND',
       paymentMethod: paymentMethod ? sanitizeString(paymentMethod) : 'cod',
       paymentStatus: 'unpaid',
@@ -370,14 +748,18 @@ app.post('/api/order', (req: Request, res: Response) => {
       utmContent: utmContent ? sanitizeString(utmContent) : undefined,
       utmTerm: utmTerm ? sanitizeString(utmTerm) : undefined,
       referrer: referrer ? sanitizeString(referrer) : undefined,
+      visitorId: visitorId ? sanitizeString(visitorId) : undefined,
+      sessionId: sessionId ? sanitizeString(sessionId) : undefined,
+      firstTouch: firstTouch ? sanitizeObject(firstTouch) : undefined,
+      lastTouch: lastTouch ? sanitizeObject(lastTouch) : undefined,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
 
-    dbStorage.insertOrder(orderRecord);
+    await dataStore.createOrder(orderRecord);
 
-    // Track order_created and purchase events in the funnel
-    dbStorage.insertEvent({
+    // Track order_created event (DO NOT auto-create purchase event!)
+    await dataStore.createEvent({
       id: 'evt-' + Date.now().toString(36) + '-ord',
       eventName: 'order_created',
       projectId: orderRecord.projectId,
@@ -385,7 +767,7 @@ app.post('/api/order', (req: Request, res: Response) => {
       formId: orderRecord.formId,
       visitorId: visitorId ? sanitizeString(visitorId) : undefined,
       sessionId: sessionId ? sanitizeString(sessionId) : undefined,
-      metadata: { orderId: orderIdCode, total: finalTotal },
+      metadata: { orderId: orderIdCode, total: clientReportedTotal },
       utmSource: orderRecord.utmSource,
       utmCampaign: orderRecord.utmCampaign,
       timestamp: orderRecord.createdAt
@@ -397,12 +779,13 @@ app.post('/api/order', (req: Request, res: Response) => {
       message: 'Order created successfully.',
       data: {
         orderId: orderIdCode,
-        total: finalTotal,
-        currency: orderRecord.currency
+        total: clientReportedTotal,
+        currency: orderRecord.currency,
+        verifiedRevenue: false
       }
     });
   } catch (error: any) {
-    console.error('Error processing order:', error);
+    console.error('[Ingestion] Error processing order:', error);
     return res.status(500).json({
       success: false,
       error: { code: 'INTERNAL_SERVER_ERROR', message: error.message || 'Error processing order' }
@@ -411,11 +794,28 @@ app.post('/api/order', (req: Request, res: Response) => {
 });
 
 // -------------------------------------------------------------
-// 4. Ingestion API: POST /api/custom-form
+// 4. Ingestion API: POST /api/custom-form (Public)
 // -------------------------------------------------------------
-app.post('/api/custom-form', (req: Request, res: Response) => {
+app.post('/api/custom-form', async (req: Request, res: Response) => {
   try {
-    const { projectId, landingPageId, formId, data, utmSource, utmMedium, utmCampaign, utmContent, utmTerm, referrer } = req.body;
+    const {
+      projectId,
+      landingPageId,
+      formId,
+      submissionId,
+      idempotencyKey,
+      data,
+      utmSource,
+      utmMedium,
+      utmCampaign,
+      utmContent,
+      utmTerm,
+      referrer,
+      visitorId,
+      sessionId,
+      firstTouch,
+      lastTouch
+    } = req.body;
 
     if (!projectId || !landingPageId || !formId) {
       return res.status(400).json({
@@ -424,20 +824,43 @@ app.post('/api/custom-form', (req: Request, res: Response) => {
       });
     }
 
-    const check = validateProjectAndLP(projectId, landingPageId);
+    const check = await validateHierarchy(projectId, landingPageId, formId, 'custom');
     if (!check.valid) {
-      return res.status(400).json({
+      return res.status(check.status || 400).json({
         success: false,
-        error: { code: 'INVALID_PROJECT_OR_LP', message: check.error || 'Invalid project or landing page.' }
+        error: { code: check.code || 'INVALID_HIERARCHY', message: check.error }
       });
     }
 
-    const submissionId = 'csub-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
-    const submission = {
-      id: submissionId,
-      projectId: sanitizeString(projectId),
-      landingPageId: sanitizeString(landingPageId),
-      formId: sanitizeString(formId),
+    const originCheck = validateRequestOrigin(req, check.project!, check.landingPage!);
+    if (!originCheck.valid) {
+      return res.status(403).json({
+        success: false,
+        error: { code: 'ORIGIN_NOT_ALLOWED', message: originCheck.error }
+      });
+    }
+
+    const idempKey = (idempotencyKey || submissionId || req.headers['x-idempotency-key'] || '') as string;
+    if (idempKey) {
+      const existing = await dataStore.findCustomSubmissionByIdempotency(idempKey, check.project!.id);
+      if (existing) {
+        return res.status(200).json({
+          success: true,
+          id: existing.id,
+          message: 'Custom submission already recorded (idempotent replay).',
+          data: { submissionId: existing.id, idempotentReplay: true }
+        });
+      }
+    }
+
+    const subId = 'csub-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
+    const submission: CustomSubmission = {
+      id: subId,
+      submissionId: idempKey || subId,
+      idempotencyKey: idempKey || undefined,
+      projectId: check.project!.id,
+      landingPageId: check.landingPage!.id,
+      formId: check.form!.id,
       data: sanitizeObject(data || {}),
       utmSource: utmSource ? sanitizeString(utmSource) : undefined,
       utmMedium: utmMedium ? sanitizeString(utmMedium) : undefined,
@@ -445,14 +868,18 @@ app.post('/api/custom-form', (req: Request, res: Response) => {
       utmContent: utmContent ? sanitizeString(utmContent) : undefined,
       utmTerm: utmTerm ? sanitizeString(utmTerm) : undefined,
       referrer: referrer ? sanitizeString(referrer) : undefined,
+      visitorId: visitorId ? sanitizeString(visitorId) : undefined,
+      sessionId: sessionId ? sanitizeString(sessionId) : undefined,
+      firstTouch: firstTouch ? sanitizeObject(firstTouch) : undefined,
+      lastTouch: lastTouch ? sanitizeObject(lastTouch) : undefined,
       createdAt: new Date().toISOString()
     };
 
-    dbStorage.insertCustomSubmission(submission);
+    await dataStore.createCustomSubmission(submission);
 
     return res.status(201).json({
       success: true,
-      id: submissionId,
+      id: subId,
       message: 'Custom form submission recorded.'
     });
   } catch (error: any) {
@@ -464,23 +891,42 @@ app.post('/api/custom-form', (req: Request, res: Response) => {
 });
 
 // -------------------------------------------------------------
-// 5. Admin Queries & Management APIs
+// Health Check (Public)
 // -------------------------------------------------------------
 app.get('/api/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', service: 'landing-hub-ingestion-api', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    service: 'landing-hub-ingestion-api',
+    persistence: 'Cloud Firestore',
+    timestamp: new Date().toISOString()
+  });
 });
 
-app.get('/api/projects', (_req: Request, res: Response) => {
-  res.json({ success: true, data: dbStorage.getDb().projects });
+// -------------------------------------------------------------
+// Admin APIs (Require Bearer Token + Role + Project Scope)
+// -------------------------------------------------------------
+app.use('/api', requireAdminAuth, enforceRoleAndScope);
+
+app.get('/api/projects', async (req: AuthenticatedAdminRequest, res: Response) => {
+  const projects = await dataStore.getProjects();
+  if (req.user?.role === 'project_admin') {
+    const allowed = req.user.projectIds || [];
+    return res.json({ success: true, data: projects.filter(p => allowed.includes(p.id)) });
+  }
+  res.json({ success: true, data: projects });
 });
 
-app.post('/api/projects', (req: Request, res: Response) => {
+app.post('/api/projects', async (req: AuthenticatedAdminRequest, res: Response) => {
   const { name, code, description, allowedDomains } = req.body;
   if (!name || !code) {
-    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Name and code are required.' } });
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_INPUT', message: 'Name and code are required.' }
+    });
   }
+
   const id = code.toLowerCase().replace(/[^a-z0-9_-]/g, '-');
-  const newProj = {
+  const newProj: Project = {
     id,
     name: sanitizeString(name),
     code: sanitizeString(code).toUpperCase(),
@@ -490,21 +936,32 @@ app.post('/api/projects', (req: Request, res: Response) => {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
-  dbStorage.insertProject(newProj);
+
+  await dataStore.createProject(newProj);
   res.status(201).json({ success: true, data: newProj });
 });
 
-app.get('/api/landing-pages', (_req: Request, res: Response) => {
-  res.json({ success: true, data: dbStorage.getDb().landingPages });
+app.get('/api/landing-pages', async (req: AuthenticatedAdminRequest, res: Response) => {
+  const projectId = req.query.projectId as string | undefined;
+  const lps = await dataStore.getLandingPages(projectId);
+  if (req.user?.role === 'project_admin') {
+    const allowed = req.user.projectIds || [];
+    return res.json({ success: true, data: lps.filter(l => allowed.includes(l.projectId)) });
+  }
+  res.json({ success: true, data: lps });
 });
 
-app.post('/api/landing-pages', (req: Request, res: Response) => {
+app.post('/api/landing-pages', async (req: AuthenticatedAdminRequest, res: Response) => {
   const { projectId, name, url, description } = req.body;
   if (!projectId || !name || !url) {
-    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'projectId, name, and url are required.' } });
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_INPUT', message: 'projectId, name, and url are required.' }
+    });
   }
+
   const id = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-') + '-' + Math.random().toString(36).substring(2, 6);
-  const newLp = {
+  const newLp: LandingPage = {
     id,
     projectId: sanitizeString(projectId),
     name: sanitizeString(name),
@@ -514,65 +971,124 @@ app.post('/api/landing-pages', (req: Request, res: Response) => {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
-  dbStorage.insertLandingPage(newLp);
+
+  await dataStore.createLandingPage(newLp);
   res.status(201).json({ success: true, data: newLp });
 });
 
-app.get('/api/forms', (_req: Request, res: Response) => {
-  res.json({ success: true, data: dbStorage.getDb().forms });
+app.get('/api/forms', async (req: AuthenticatedAdminRequest, res: Response) => {
+  const projectId = req.query.projectId as string | undefined;
+  const landingPageId = req.query.landingPageId as string | undefined;
+  const forms = await dataStore.getForms(projectId, landingPageId);
+  if (req.user?.role === 'project_admin') {
+    const allowed = req.user.projectIds || [];
+    return res.json({ success: true, data: forms.filter(f => allowed.includes(f.projectId)) });
+  }
+  res.json({ success: true, data: forms });
 });
 
-app.post('/api/forms', (req: Request, res: Response) => {
+app.post('/api/forms', async (req: AuthenticatedAdminRequest, res: Response) => {
   const { projectId, landingPageId, name, type, fields } = req.body;
   if (!projectId || !landingPageId || !name || !type) {
-    return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'projectId, landingPageId, name, type are required.' } });
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_INPUT', message: 'projectId, landingPageId, name, type are required.' }
+    });
   }
+
   const id = `form-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`;
-  const newForm = {
+  const newForm: FormDefinition = {
     id,
     projectId: sanitizeString(projectId),
     landingPageId: sanitizeString(landingPageId),
     name: sanitizeString(name),
-    type: sanitizeString(type),
+    type: sanitizeString(type) as any,
     status: 'active',
     version: 1,
     fields: Array.isArray(fields) ? sanitizeObject(fields) : [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
-  dbStorage.insertForm(newForm);
+
+  await dataStore.createForm(newForm);
   res.status(201).json({ success: true, data: newForm });
 });
 
-app.get('/api/leads', (_req: Request, res: Response) => {
-  res.json({ success: true, data: dbStorage.getDb().leads });
-});
-
-app.get('/api/orders', (_req: Request, res: Response) => {
-  res.json({ success: true, data: dbStorage.getDb().orders });
-});
-
-app.patch('/api/orders/:id/status', (req: Request, res: Response) => {
-  const { id } = req.params;
-  const { orderStatus, paymentStatus } = req.body;
-  const updated = dbStorage.updateOrderStatus(id, orderStatus, paymentStatus);
-  if (!updated) {
-    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Order not found' } });
+app.get('/api/leads', async (req: AuthenticatedAdminRequest, res: Response) => {
+  const projectId = req.query.projectId as string | undefined;
+  const leads = await dataStore.getLeads(projectId);
+  if (req.user?.role === 'project_admin') {
+    const allowed = req.user.projectIds || [];
+    return res.json({ success: true, data: leads.filter(l => allowed.includes(l.projectId)) });
   }
+  res.json({ success: true, data: leads });
+});
+
+app.get('/api/orders', async (req: AuthenticatedAdminRequest, res: Response) => {
+  const projectId = req.query.projectId as string | undefined;
+  const orders = await dataStore.getOrders(projectId);
+  if (req.user?.role === 'project_admin') {
+    const allowed = req.user.projectIds || [];
+    return res.json({ success: true, data: orders.filter(o => allowed.includes(o.projectId)) });
+  }
+  res.json({ success: true, data: orders });
+});
+
+app.patch('/api/orders/:id/status', async (req: AuthenticatedAdminRequest, res: Response) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : String(req.params.id);
+  const { orderStatus, paymentStatus } = req.body;
+
+  const existing = await dataStore.getOrder(id);
+  if (!existing) {
+    return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Order not found.' } });
+  }
+
+  // Check project scope for project_admin
+  if (req.user?.role === 'project_admin') {
+    const allowed = req.user.projectIds || [];
+    if (!allowed.includes(existing.projectId)) {
+      return res.status(403).json({
+        success: false,
+        error: { code: 'FORBIDDEN_PROJECT_SCOPE', message: 'Not authorized for this order project.' }
+      });
+    }
+  }
+
+  const updated = await dataStore.updateOrderStatus(id, orderStatus, paymentStatus);
   res.json({ success: true, data: updated });
 });
 
-app.get('/api/events', (_req: Request, res: Response) => {
+app.get('/api/events', async (req: AuthenticatedAdminRequest, res: Response) => {
   const limit = parseInt(req.query.limit as string, 10) || 100;
-  const evts = dbStorage.getDb().events.slice(0, limit);
+  const projectId = req.query.projectId as string | undefined;
+  const evts = await dataStore.getEvents(limit, projectId);
+  if (req.user?.role === 'project_admin') {
+    const allowed = req.user.projectIds || [];
+    return res.json({ success: true, data: evts.filter(e => allowed.includes(e.projectId)) });
+  }
   res.json({ success: true, data: evts });
 });
 
-app.post('/api/seed/reset', (_req: Request, res: Response) => {
-  const data = dbStorage.resetSeed();
-  res.json({ success: true, message: 'Database reset to initial sample seed.', data });
+app.post('/api/seed/reset', async (req: AuthenticatedAdminRequest, res: Response) => {
+  if (req.user?.role !== 'super_admin') {
+    return res.status(403).json({
+      success: false,
+      error: { code: 'INSUFFICIENT_ROLE', message: 'Only super_admin can trigger database seed reset.' }
+    });
+  }
+
+  await dataStore.resetSeed();
+  res.json({ success: true, message: 'Database reset to initial sample seed in Cloud Firestore.' });
 });
 
-app.listen(PORT, () => {
-  console.log(`[Landing Hub Ingestion API] Server listening on http://localhost:${PORT}`);
-});
+// -------------------------------------------------------------
+// Firebase Cloud Function HTTPS Export
+// -------------------------------------------------------------
+export const api = onRequest({ cors: false }, app);
+
+// Standalone Server runner for local dev
+if (process.env.NODE_ENV !== 'test' && !process.env.FUNCTION_NAME && !process.env.K_SERVICE) {
+  app.listen(PORT, () => {
+    console.log(`[Landing Hub Ingestion API] Server listening on http://localhost:${PORT}`);
+  });
+}

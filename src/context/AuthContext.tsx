@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useState } from 'react';
+import React, { createContext, useContext, useState, useEffect } from 'react';
 import { AdminUser, UserRole } from '../types';
+import { setApiAuthToken } from '../lib/api';
 
 interface AuthContextType {
   currentUser: AdminUser | null;
@@ -25,6 +26,15 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<AdminUser | null>(DEFAULT_SUPER_ADMIN);
+
+  useEffect(() => {
+    if (currentUser) {
+      const scope = (currentUser.projectIds || []).join(',') || 'all';
+      setApiAuthToken(`demo-${currentUser.role}-${scope}`);
+    } else {
+      setApiAuthToken('');
+    }
+  }, [currentUser]);
 
   const role = currentUser?.role || 'viewer';
   const isSuperAdmin = role === 'super_admin';

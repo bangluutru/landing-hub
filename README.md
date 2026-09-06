@@ -10,77 +10,114 @@ Landing Hub là hệ thống trung tâm quản trị và tiếp nhận dữ li�
 Landing Pages (Figma / Stitch / HTML / React)
      ↓
 AIWF LP SDK (@aiwf/lp-sdk / lphub.js)
-     ↓ (HTTP REST POST)
+     ↓ (HTTP REST POST with Origin & Idempotency Key)
 Landing Hub Ingestion API (Express / Firebase Cloud Functions)
-     ↓ (Firebase Admin SDK / Firestore Server)
-Cloud Firestore (projects, landingPages, forms, leads, orders, events)
+     ↓ (Firebase Admin SDK / Cloud Firestore)
+Cloud Firestore (projects, landingPages, forms, leads, orders, customSubmissions, events, users)
      ↓
 Landing Hub Admin UI (React + TypeScript + Tailwind CSS / Cloudflare Pages)
 ```
 
 > **Nguyên tắc cốt lõi (Zero-Direct-Firestore-Write)**:
-> Landing page bên ngoài **tuyệt đối không được ghi trực tiếp vào Firestore**. Toàn bộ lượt tương tác, lead đăng ký, đơn đặt hàng và event conversion bắt buộc phải gửi qua tầng **Ingestion API** của Landing Hub để thực hiện validate schema, sanitize dữ liệu, phòng chống spam/rate limit và gắn server timestamp trước khi lưu trữ.
+> Landing page bên ngoài **tuyệt đối không được ghi trực tiếp vào Firestore**. Toàn bộ tương tác, lead đăng ký, đơn đặt hàng và event conversion bắt buộc phải gửi qua tầng **Ingestion API** của Landing Hub để thực hiện validate hierarchy, origin whitelisting, sanitize dữ liệu, phòng chống spam/rate limit, bảo đảm idempotency và ghi trực tiếp vào Cloud Firestore qua Firebase Admin SDK.
 
 ---
 
-## 2. Multi-Project Structure
+## 2. Multi-Project Structure & Strict Hierarchy
 
-Hệ thống được thiết kế hỗ trợ đa doanh nghiệp / dự án ngay từ đầu:
+Hệ thống hỗ trợ đa doanh nghiệp / dự án:
 - **ABANO Wellness** (`code: ABANO`) — Mỹ phẩm & Dược mỹ phẩm hữu cơ.
 - **Genki Fami** (`code: GENKI`) — Thực phẩm bảo vệ sức khoẻ tiêu chuẩn Nhật Bản.
 - **Balancera** (`code: BALANCERA`) — Dinh dưỡng & Thể hình.
 - **Huma Medical** (`code: HUMA`) — Thiết bị y tế gia đình.
 
-Mỗi Landing Page luôn gắn liền với `projectId` và `landingPageId`.
-Mỗi Form có `formId` và `formType` (`lead` | `order` | `custom`).
+### Chuỗi kiểm tra Hierarchy nghiêm ngặt:
+Mọi ingestion request được xác thực tuần tự 7 bước trước khi xử lý:
+$$\text{Project tồn tại \& active} \rightarrow \text{Landing Page tồn tại \& active} \rightarrow \text{LP thuộc Project} \rightarrow \text{Form tồn tại \& active} \rightarrow \text{Form thuộc Project} \rightarrow \text{Form thuộc LP} \rightarrow \text{Form type khớp endpoint}$$
+
+- `/api/lead` $\rightarrow$ `form.type === 'lead'`
+- `/api/order` $\rightarrow$ `form.type === 'order'`
+- `/api/custom-form` $\rightarrow$ `form.type === 'custom'`
+
+Nếu có bất kỳ sai lệch nào, server trả về `400 Bad Request` với mã lỗi tường minh (`PROJECT_NOT_FOUND`, `INVALID_LP_HIERARCHY`, `INVALID_FORM_TYPE`, v.v.).
 
 ---
 
-## 3. Ingestion API Endpoints
+## 3. Production Hardening Features
 
-Server API lắng nghe tại port `3001` (hoặc deploy dưới dạng Firebase Cloud Functions / Cloudflare Worker container):
+1. **Native Cloud Firestore Persistence**:
+   - Toàn bộ dữ liệu lưu trữ tại Cloud Firestore: `projects`, `landingPages`, `forms`, `leads`, `orders`, `customSubmissions`, `events`, `users`.
+   - Loại bỏ hoàn toàn local JSON storage khỏi production path.
+   - Hàm seed ghi trực tiếp vào Firestore collections qua Admin SDK.
 
-| Phương thức | Endpoint | Mô tả |
-|---|---|---|
-| `POST` | `/api/track` | Ghi nhận sự kiện chuyển đổi (`page_view`, `cta_click`, `form_start`, `form_submit`, `order_created`, `purchase`, v.v.) |
-| `POST` | `/api/lead` | Tiếp nhận Lead đăng ký tư vấn (họ tên, SĐT, email, dữ liệu khảo sát `data`) |
-| `POST` | `/api/order` | Tiếp nhận Đơn đặt hàng (khách hàng, danh sách sản phẩm, tổng tiền, COD/Chuyển khoản) |
-| `POST` | `/api/custom-form` | Tiếp nhận Form tùy biến linh hoạt |
-| `GET` | `/api/health` | Kiểm tra trạng thái hoạt động của dịch vụ |
-| `GET` | `/api/leads` | Danh sách leads đã thu thập |
-| `GET` | `/api/orders` | Danh sách đơn hàng |
-| `PATCH` | `/api/orders/:id/status` | Cập nhật trạng thái đơn và trạng thái thanh toán |
-| `POST` | `/api/seed/reset` | Khôi phục bộ dữ liệu mẫu chuẩn (ABANO, Genki Fami) |
+2. **Firebase Cloud Functions Ready**:
+   - Thư mục `server/` chứa cấu hình độc lập (`package.json`, `tsconfig.json`) với entry point `lib/index.js`.
+   - Export HTTPS function `api` sẵn sàng cho `firebase deploy --only functions,firestore:rules`.
+   - Hỗ trợ chạy local độc lập thông qua `npm run server` (tsx).
 
-### Chuẩn phản hồi (Standard Response)
-- Thành công:
-```json
-{
-  "success": true,
-  "id": "ORD-20260906-8714",
-  "message": "Order created successfully."
-}
-```
-- Lỗi:
-```json
-{
-  "success": false,
-  "error": {
-    "code": "MISSING_REQUIRED_FIELDS",
-    "message": "projectId, landingPageId, and formId are required."
-  }
-}
-```
+3. **Origin Validation & CORS**:
+   - Chặn CORS `origin: '*'` trong production.
+   - Public Ingestion API kiểm tra `Origin` / `Referer` khớp với `project.allowedDomains` hoặc domain của `landingPage.url`.
+   - Cho phép localhost trong môi trường development và automated test.
+
+4. **Idempotency & Deduplication**:
+   - SDK tự động tạo `idempotencyKey` (`submissionId`).
+   - Double-click, network retry hoặc client retry với cùng key sẽ trả về bản ghi hiện có (`200 OK` với `idempotentReplay: true`), không tạo duplicate lead/order/event.
+
+5. **Order Integrity (Unverified Revenue)**:
+   - Lưu trữ rõ ràng `clientReportedSubtotal`, `clientReportedTotal` và `serverCalculatedSubtotal` (tính từ item quantity * price).
+   - Đánh dấu `verifiedRevenue: false` cho đến khi server có module đối soát với Catalog trung tâm.
+
+6. **Attribution Persistence**:
+   - SDK lưu `firstTouch` và `lastTouch` vào `localStorage`.
+   - Giữ nguyên thông tin chiến dịch (`utm_source`, `utm_campaign`, `referrer`) kể cả khi khách chuyển trang nội bộ làm mất query params.
+
+7. **Standard Event Semantics**:
+   - Chuẩn event V1: `page_view`, `cta_click`, `form_view`, `form_start`, `form_submit`, `order_created`, `purchase`.
+   - `order_created` không tự động coi là `purchase`. Event `purchase` là sự kiện độc lập.
+
+8. **Admin API Authentication & Role Scoping**:
+   - Mọi Admin API yêu cầu `Authorization: Bearer <token>`.
+   - Phân quyền 3 roles:
+     - `super_admin`: toàn quyền quản trị.
+     - `project_admin`: chỉ thao tác trên các `projectIds` được cấp phép.
+     - `viewer`: chế độ chỉ đọc (`GET`).
 
 ---
 
-## 4. AIWF LP SDK
+## 4. Ingestion & Admin API Endpoints
 
-SDK độc lập, siêu nhẹ (< 5KB), không phụ thuộc framework, tự động trích xuất:
-- `utm_source`, `utm_medium`, `utm_campaign`, `utm_content`, `utm_term`
-- `referrer`
-- `visitorId` ẩn danh (lưu vĩnh viễn trong `localStorage`)
-- `sessionId` (lưu theo phiên duyệt web trong `sessionStorage`)
+Server API lắng nghe tại port `3001` (hoặc deploy dưới dạng Firebase Cloud Functions):
+
+| Phương thức | Endpoint | Phân quyền | Mô tả |
+|---|---|---|---|
+| `POST` | `/api/track` | Public | Ghi nhận sự kiện chuyển đổi |
+| `POST` | `/api/lead` | Public | Tiếp nhận Lead đăng ký tư vấn |
+| `POST` | `/api/order` | Public | Tiếp nhận Đơn đặt hàng (Idempotent) |
+| `POST` | `/api/custom-form` | Public | Tiếp nhận Form tùy biến linh hoạt |
+| `GET` | `/api/health` | Public | Trạng thái hệ thống & Firestore provider |
+| `GET` | `/api/projects` | Admin | Danh sách dự án |
+| `POST` | `/api/projects` | Super Admin | Tạo mới dự án |
+| `GET` | `/api/landing-pages` | Admin | Danh sách Landing Pages (hỗ trợ lọc `projectId`) |
+| `POST` | `/api/landing-pages` | Admin | Đăng ký Landing Page mới |
+| `GET` | `/api/forms` | Admin | Danh sách Form schemas |
+| `POST` | `/api/forms` | Admin | Đăng ký Form schema |
+| `GET` | `/api/leads` | Admin | Danh sách leads đã thu thập |
+| `GET` | `/api/orders` | Admin | Danh sách đơn hàng |
+| `PATCH`| `/api/orders/:id/status`| Admin | Cập nhật trạng thái đơn & thanh toán |
+| `GET` | `/api/events` | Admin | Log sự kiện hành vi |
+| `POST` | `/api/seed/reset` | Super Admin | Khôi phục bộ dữ liệu mẫu chuẩn |
+
+---
+
+## 5. AIWF LP SDK
+
+SDK độc lập, siêu nhẹ (< 5KB), không phụ thuộc framework, tự động quản lý:
+- `firstTouch` & `lastTouch` attribution (`utm_*`, `referrer`)
+- `visitorId` ẩn danh (lưu trong `localStorage`)
+- `sessionId` (lưu trong `sessionStorage`)
+- `idempotencyKey` tự sinh chống duplicate submit
+- Default fallback `apiUrl` về domain hiện tại nếu bị bỏ trống
 
 ### Cách nhúng vào Landing Page:
 ```html
@@ -88,11 +125,10 @@ SDK độc lập, siêu nhẹ (< 5KB), không phụ thuộc framework, tự đ�
 <script src="https://hub.yourdomain.com/sdk/lphub.js"></script>
 
 <script>
-  // 2. Khởi tạo SDK
+  // 2. Khởi tạo SDK (apiUrl là tùy chọn, mặc định lấy origin hiện tại)
   LPHub.init({
     projectId: 'abano',
-    landingPageId: 'abano-serum-promo',
-    apiUrl: 'https://hub.yourdomain.com'
+    landingPageId: 'abano-serum-promo'
   });
 
   // 3. Theo dõi CTA Click
@@ -109,7 +145,7 @@ SDK độc lập, siêu nhẹ (< 5KB), không phụ thuộc framework, tự đ�
     data: { skinType: 'Da nhạy cảm' }
   });
 
-  // 5. Gửi Đơn đặt hàng
+  // 5. Gửi Đơn đặt hàng (Idempotent)
   LPHub.submitOrder({
     formId: 'abano-order-form-01',
     customer: {
@@ -129,20 +165,9 @@ SDK độc lập, siêu nhẹ (< 5KB), không phụ thuộc framework, tự đ�
 
 ---
 
-## 5. Phân Quyền & Quản Trị
+## 6. Chạy Thử & Kiểm Thử
 
-Hệ thống hỗ trợ 3 nhóm vai trò:
-1. **Super Admin**: Quản trị toàn hệ thống, xem và thao tác trên mọi project.
-2. **Project Admin**: Chỉ có quyền xem và thao tác trên project được phân quyền (ví dụ quản lý riêng ABANO).
-3. **Viewer**: Chế độ chỉ xem (Read-only), không chỉnh sửa schema hoặc đổi trạng thái đơn hàng.
-
-*Admin UI tích hợp sẵn thanh chuyển đổi vai trò (Role Switcher) ở góc trái dưới cùng để kiểm thử nhanh chóng.*
-
----
-
-## 6. Chạy Thử & Kiểm Thử Tại Local
-
-### Bước 1: Khởi động hệ thống
+### Khởi động hệ thống tại local:
 ```bash
 # Terminal 1: Chạy Ingestion API Server (port 3001)
 npm run server
@@ -154,34 +179,37 @@ npm run dev
 npm run dev:all
 ```
 
-### Bước 2: Trải nghiệm Demo Landing Page thực tế
-Mở trình duyệt truy cập:
-👉 `http://localhost:5173/demo/index.html?utm_source=facebook&utm_campaign=spring_promo`
-
-- Bấm nút "Mua ngay" hoặc "Nhận tư vấn" → theo dõi live log sự kiện `cta_click`.
-- Điền form Tư Vấn → gửi `submitLead` → lead được lưu ngay lập tức vào database.
-- Điền form Đặt Hàng → gửi `submitOrder` → đơn hàng được tạo với mã chuẩn `ORD-YYYYMMDD-XXXX`.
-- Mở Admin Dashboard tại `http://localhost:5173/` để thấy lead, order và biểu đồ Funnel Analytics cập nhật trực tiếp!
+### Chạy bộ Automated Tests (14 test cases):
+```bash
+npm test
+```
+Kiểm chứng tự động toàn bộ 14 kịch bản:
+- `valid lead`, `valid order`, `valid custom form`
+- `unknown project`, `wrong landingPage/project relationship`
+- `unknown form`, `wrong form type`, `inactive form`
+- `wrong origin`
+- `duplicate order submission (idempotency)`
+- `unauthorized admin API`, `project_admin accessing another project`
+- `viewer role restriction`
+- `health check`
 
 ---
 
-## 7. Hướng Dẫn Deploy Production
+## 7. Deploy Production
+
+### Backend Ingestion API & Security Rules:
+```bash
+# Build Cloud Functions bundle
+npm --prefix server run build
+
+# Deploy Cloud Functions & Firestore Rules
+firebase deploy --only functions,firestore:rules
+```
 
 ### Frontend Admin (Cloudflare Pages):
 ```bash
-# Build production bundle
 npm run build
-
-# Deploy qua Cloudflare Pages CLI
 npx wrangler pages deploy dist --project-name=landing-hub
 ```
-Cấu hình biến môi trường trên Cloudflare Pages dashboard:
-- `VITE_FIREBASE_API_KEY`: API Key Firebase của dự án.
-- `VITE_FIREBASE_PROJECT_ID`: ID dự án Firebase.
 
-### Backend Ingestion API (Firebase Functions):
-```bash
-# Deploy Firebase Cloud Functions & Firestore Rules
-firebase deploy --only functions,firestore:rules
-```
-Cấu hình rule trong `firestore.rules` đảm bảo bảo mật tuyệt đối, chặn landing page client ghi trực tiếp.
+Tài liệu chi tiết về contract tích hợp được lưu tại [docs/INTEGRATION-CONTRACT-DRAFT.md](docs/INTEGRATION-CONTRACT-DRAFT.md) (Status: `Draft 0.9 — Not Frozen`).

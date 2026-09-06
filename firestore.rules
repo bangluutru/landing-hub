@@ -1,0 +1,67 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to check if user is authenticated admin
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function getUserRole() {
+      return request.auth.token.role;
+    }
+    
+    function isSuperAdmin() {
+      return isAuthenticated() && (getUserRole() == 'super_admin' || request.auth.token.admin == true);
+    }
+
+    // STRICT ARCHITECTURAL PRINCIPLE:
+    // Anonymous public landing pages CANNOT write directly to Firestore!
+    // External writes MUST go through Landing Hub's Ingestion API Server (Firebase Admin SDK).
+    
+    match /projects/{projectId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+    
+    match /landingPages/{lpId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+    
+    match /forms/{formId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+    
+    match /leads/{leadId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+    
+    match /orders/{orderId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+    
+    match /customSubmissions/{submissionId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+    
+    match /events/{eventId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+    
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+    
+    // Deny all other direct client access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

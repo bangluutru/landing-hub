@@ -295,18 +295,34 @@ async function requireAdminAuth(req: AuthenticatedAdminRequest, res: Response, n
 
   const token = authHeader.substring(7).trim();
 
-  // Support demo and test tokens for local dev and testing suites
+  // Support demo and test tokens strictly when NOT production AND explicitly enabled via ALLOW_TEST_TOKENS=true
   if (token.startsWith('demo-') || token.startsWith('test-')) {
-    const parts = token.split('-');
-    const role = (parts[1] as UserRole) || 'super_admin';
-    const scope = parts[2] ? parts[2].split(',') : ['abano'];
-    req.user = {
-      uid: `usr-${parts[1]}`,
-      email: `${role}@landinghub.aiwf`,
-      role,
-      projectIds: role === 'project_admin' ? scope : undefined
-    };
-    return next();
+    const isProduction = process.env.NODE_ENV === 'production';
+    const allowTestTokens = process.env.ALLOW_TEST_TOKENS === 'true';
+
+    if (!isProduction && allowTestTokens) {
+      const parts = token.split('-');
+      const role = (parts[1] as UserRole) || 'super_admin';
+      const scope = parts[2] ? parts[2].split(',') : ['abano'];
+      req.user = {
+        uid: `usr-${parts[1]}`,
+        email: `${role}@landinghub.aiwf`,
+        role,
+        projectIds: role === 'project_admin' ? scope : undefined
+      };
+      return next();
+    }
+
+    // Fail closed: reject test/demo tokens in production or when ALLOW_TEST_TOKENS is not true
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'UNAUTHORIZED',
+        message: isProduction
+          ? 'Test and demo tokens are strictly prohibited in production environment.'
+          : 'Test tokens are disabled. Set ALLOW_TEST_TOKENS=true in non-production environment to enable.'
+      }
+    });
   }
 
   try {
@@ -531,68 +547,69 @@ app.post('/api/lead', async (req: Request, res: Response) => {
       });
     }
 
-    // Idempotency Check
+    // Atomic Idempotent Lead Creation
     const idempKey = (idempotencyKey || submissionId || req.headers['x-idempotency-key'] || '') as string;
-    if (idempKey) {
-      const existing = await dataStore.findLeadByIdempotency(idempKey, check.project!.id);
-      if (existing) {
-        return res.status(200).json({
-          success: true,
-          id: existing.id,
-          message: 'Lead already captured (idempotent replay).',
-          data: { leadId: existing.id, idempotentReplay: true }
-        });
-      }
-    }
-
-    const leadId = 'lead-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 7);
     const sanitizedData = sanitizeObject(data || {});
 
-    const leadRecord: Lead = {
-      id: leadId,
-      submissionId: idempKey || leadId,
-      idempotencyKey: idempKey || undefined,
-      projectId: check.project!.id,
-      landingPageId: check.landingPage!.id,
-      formId: check.form!.id,
-      name: name ? sanitizeString(name) : (sanitizedData.name || sanitizedData.fullName || undefined),
-      phone: phone ? sanitizeString(phone) : (sanitizedData.phone || sanitizedData.phoneNumber || undefined),
-      email: email ? sanitizeString(email) : (sanitizedData.email || undefined),
-      data: sanitizedData,
-      utmSource: utmSource ? sanitizeString(utmSource) : undefined,
-      utmMedium: utmMedium ? sanitizeString(utmMedium) : undefined,
-      utmCampaign: utmCampaign ? sanitizeString(utmCampaign) : undefined,
-      utmContent: utmContent ? sanitizeString(utmContent) : undefined,
-      utmTerm: utmTerm ? sanitizeString(utmTerm) : undefined,
-      referrer: referrer ? sanitizeString(referrer) : undefined,
-      pageUrl: pageUrl ? sanitizeString(pageUrl) : undefined,
-      visitorId: visitorId ? sanitizeString(visitorId) : undefined,
-      sessionId: sessionId ? sanitizeString(sessionId) : undefined,
-      firstTouch: firstTouch ? sanitizeObject(firstTouch) : undefined,
-      lastTouch: lastTouch ? sanitizeObject(lastTouch) : undefined,
-      createdAt: new Date().toISOString()
-    };
+    const { isReplay, lead } = await dataStore.atomicCreateLead(
+      check.project!.id,
+      idempKey || undefined,
+      () => {
+        const leadId = 'lead-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 7);
+        return {
+          id: leadId,
+          submissionId: idempKey || leadId,
+          idempotencyKey: idempKey || undefined,
+          projectId: check.project!.id,
+          landingPageId: check.landingPage!.id,
+          formId: check.form!.id,
+          name: name ? sanitizeString(name) : (sanitizedData.name || sanitizedData.fullName || undefined),
+          phone: phone ? sanitizeString(phone) : (sanitizedData.phone || sanitizedData.phoneNumber || undefined),
+          email: email ? sanitizeString(email) : (sanitizedData.email || undefined),
+          data: sanitizedData,
+          utmSource: utmSource ? sanitizeString(utmSource) : undefined,
+          utmMedium: utmMedium ? sanitizeString(utmMedium) : undefined,
+          utmCampaign: utmCampaign ? sanitizeString(utmCampaign) : undefined,
+          utmContent: utmContent ? sanitizeString(utmContent) : undefined,
+          utmTerm: utmTerm ? sanitizeString(utmTerm) : undefined,
+          referrer: referrer ? sanitizeString(referrer) : undefined,
+          pageUrl: pageUrl ? sanitizeString(pageUrl) : undefined,
+          visitorId: visitorId ? sanitizeString(visitorId) : undefined,
+          sessionId: sessionId ? sanitizeString(sessionId) : undefined,
+          firstTouch: firstTouch ? sanitizeObject(firstTouch) : undefined,
+          lastTouch: lastTouch ? sanitizeObject(lastTouch) : undefined,
+          createdAt: new Date().toISOString()
+        };
+      }
+    );
 
-    await dataStore.createLead(leadRecord);
+    if (isReplay) {
+      return res.status(200).json({
+        success: true,
+        id: lead.id,
+        message: 'Lead already captured (idempotent replay).',
+        data: { leadId: lead.id, idempotentReplay: true }
+      });
+    }
 
-    // Auto-track 'form_submit' event for conversion funnel
+    // Auto-track 'form_submit' event for conversion funnel ONLY on new creation (not replay)
     await dataStore.createEvent({
       id: 'evt-' + Date.now().toString(36) + '-sub',
       eventName: 'form_submit',
-      projectId: leadRecord.projectId,
-      landingPageId: leadRecord.landingPageId,
-      formId: leadRecord.formId,
-      visitorId: leadRecord.visitorId,
-      sessionId: leadRecord.sessionId,
-      metadata: { leadId },
-      utmSource: leadRecord.utmSource,
-      utmCampaign: leadRecord.utmCampaign,
-      timestamp: leadRecord.createdAt
+      projectId: lead.projectId,
+      landingPageId: lead.landingPageId,
+      formId: lead.formId,
+      visitorId: lead.visitorId,
+      sessionId: lead.sessionId,
+      metadata: { leadId: lead.id },
+      utmSource: lead.utmSource,
+      utmCampaign: lead.utmCampaign,
+      timestamp: lead.createdAt
     });
 
     return res.status(201).json({
       success: true,
-      id: leadId,
+      id: lead.id,
       message: 'Lead captured successfully.'
     });
   } catch (error: any) {
@@ -669,25 +686,6 @@ app.post('/api/order', async (req: Request, res: Response) => {
       });
     }
 
-    // Idempotency Check: Prevent duplicate order creation on retry or double-clicks
-    const idempKey = (idempotencyKey || submissionId || req.headers['x-idempotency-key'] || '') as string;
-    if (idempKey) {
-      const existing = await dataStore.findOrderByIdempotency(idempKey, check.project!.id);
-      if (existing) {
-        return res.status(200).json({
-          success: true,
-          id: existing.orderId,
-          message: 'Order already created (idempotent replay).',
-          data: {
-            orderId: existing.orderId,
-            total: existing.total,
-            currency: existing.currency,
-            idempotentReplay: true
-          }
-        });
-      }
-    }
-
     // Order Integrity Calculation:
     // Do NOT blindly trust browser price/total. Calculate serverCalculatedSubtotal.
     let serverCalculatedSubtotal = 0;
@@ -707,80 +705,99 @@ app.post('/api/order', async (req: Request, res: Response) => {
     const clientReportedSubtotal = subtotal != null ? parseFloat(subtotal) : serverCalculatedSubtotal;
     const clientReportedTotal = total != null ? parseFloat(total) : serverCalculatedSubtotal;
 
-    // Generate human-readable order code
-    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const randCode = Math.floor(1000 + Math.random() * 9000);
-    const orderIdCode = `ORD-${dateStr}-${randCode}`;
-    const internalId = 'ord-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
+    const idempKey = (idempotencyKey || submissionId || req.headers['x-idempotency-key'] || '') as string;
 
-    const orderRecord: Order = {
-      id: internalId,
-      orderId: orderIdCode,
-      submissionId: idempKey || internalId,
-      idempotencyKey: idempKey || undefined,
-      projectId: check.project!.id,
-      landingPageId: check.landingPage!.id,
-      formId: check.form!.id,
-      customer: {
-        name: sanitizeString(customer.name || 'Khách hàng'),
-        phone: sanitizeString(customer.phone || ''),
-        email: customer.email ? sanitizeString(customer.email) : undefined,
-        address: customer.address ? sanitizeString(customer.address) : undefined,
-        note: customer.note ? sanitizeString(customer.note) : undefined
-      },
-      items: sanitizedItems,
-      // Order integrity fields
-      clientReportedSubtotal,
-      clientReportedTotal,
-      serverCalculatedSubtotal,
-      serverCalculatedTotal: serverCalculatedSubtotal,
-      verifiedRevenue: false, // V1 without product catalog does not mark revenue as verified
-      subtotal: clientReportedSubtotal,
-      total: clientReportedTotal,
-      currency: currency ? sanitizeString(currency).toUpperCase() : 'VND',
-      paymentMethod: paymentMethod ? sanitizeString(paymentMethod) : 'cod',
-      paymentStatus: 'unpaid',
-      orderStatus: 'new',
-      data: sanitizeObject(data || {}),
-      utmSource: utmSource ? sanitizeString(utmSource) : undefined,
-      utmMedium: utmMedium ? sanitizeString(utmMedium) : undefined,
-      utmCampaign: utmCampaign ? sanitizeString(utmCampaign) : undefined,
-      utmContent: utmContent ? sanitizeString(utmContent) : undefined,
-      utmTerm: utmTerm ? sanitizeString(utmTerm) : undefined,
-      referrer: referrer ? sanitizeString(referrer) : undefined,
-      visitorId: visitorId ? sanitizeString(visitorId) : undefined,
-      sessionId: sessionId ? sanitizeString(sessionId) : undefined,
-      firstTouch: firstTouch ? sanitizeObject(firstTouch) : undefined,
-      lastTouch: lastTouch ? sanitizeObject(lastTouch) : undefined,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
+    const { isReplay, order } = await dataStore.atomicCreateOrder(
+      check.project!.id,
+      idempKey || undefined,
+      () => {
+        const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+        const randCode = Math.floor(1000 + Math.random() * 9000);
+        const orderIdCode = `ORD-${dateStr}-${randCode}`;
+        const internalId = 'ord-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
 
-    await dataStore.createOrder(orderRecord);
+        return {
+          id: internalId,
+          orderId: orderIdCode,
+          submissionId: idempKey || internalId,
+          idempotencyKey: idempKey || undefined,
+          projectId: check.project!.id,
+          landingPageId: check.landingPage!.id,
+          formId: check.form!.id,
+          customer: {
+            name: sanitizeString(customer.name || 'Khách hàng'),
+            phone: sanitizeString(customer.phone || ''),
+            email: customer.email ? sanitizeString(customer.email) : undefined,
+            address: customer.address ? sanitizeString(customer.address) : undefined,
+            note: customer.note ? sanitizeString(customer.note) : undefined
+          },
+          items: sanitizedItems,
+          // Order integrity fields
+          clientReportedSubtotal,
+          clientReportedTotal,
+          serverCalculatedSubtotal,
+          serverCalculatedTotal: serverCalculatedSubtotal,
+          verifiedRevenue: false, // V1 without product catalog does not mark revenue as verified
+          subtotal: clientReportedSubtotal,
+          total: clientReportedTotal,
+          currency: currency ? sanitizeString(currency).toUpperCase() : 'VND',
+          paymentMethod: paymentMethod ? sanitizeString(paymentMethod) : 'cod',
+          paymentStatus: 'unpaid',
+          orderStatus: 'new',
+          data: sanitizeObject(data || {}),
+          utmSource: utmSource ? sanitizeString(utmSource) : undefined,
+          utmMedium: utmMedium ? sanitizeString(utmMedium) : undefined,
+          utmCampaign: utmCampaign ? sanitizeString(utmCampaign) : undefined,
+          utmContent: utmContent ? sanitizeString(utmContent) : undefined,
+          utmTerm: utmTerm ? sanitizeString(utmTerm) : undefined,
+          referrer: referrer ? sanitizeString(referrer) : undefined,
+          visitorId: visitorId ? sanitizeString(visitorId) : undefined,
+          sessionId: sessionId ? sanitizeString(sessionId) : undefined,
+          firstTouch: firstTouch ? sanitizeObject(firstTouch) : undefined,
+          lastTouch: lastTouch ? sanitizeObject(lastTouch) : undefined,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+      }
+    );
 
-    // Track order_created event (DO NOT auto-create purchase event!)
+    if (isReplay) {
+      return res.status(200).json({
+        success: true,
+        id: order.orderId,
+        message: 'Order already created (idempotent replay).',
+        data: {
+          orderId: order.orderId,
+          total: order.total,
+          currency: order.currency,
+          idempotentReplay: true
+        }
+      });
+    }
+
+    // Track order_created event (DO NOT auto-create purchase event!) ONLY on new order
     await dataStore.createEvent({
       id: 'evt-' + Date.now().toString(36) + '-ord',
       eventName: 'order_created',
-      projectId: orderRecord.projectId,
-      landingPageId: orderRecord.landingPageId,
-      formId: orderRecord.formId,
+      projectId: order.projectId,
+      landingPageId: order.landingPageId,
+      formId: order.formId,
       visitorId: visitorId ? sanitizeString(visitorId) : undefined,
       sessionId: sessionId ? sanitizeString(sessionId) : undefined,
-      metadata: { orderId: orderIdCode, total: clientReportedTotal },
-      utmSource: orderRecord.utmSource,
-      utmCampaign: orderRecord.utmCampaign,
-      timestamp: orderRecord.createdAt
+      metadata: { orderId: order.orderId, total: order.clientReportedTotal },
+      utmSource: order.utmSource,
+      utmCampaign: order.utmCampaign,
+      timestamp: order.createdAt
     });
 
     return res.status(201).json({
       success: true,
-      id: orderIdCode,
+      id: order.orderId,
       message: 'Order created successfully.',
       data: {
-        orderId: orderIdCode,
-        total: clientReportedTotal,
-        currency: orderRecord.currency,
+        orderId: order.orderId,
+        total: order.clientReportedTotal,
+        currency: order.currency,
         verifiedRevenue: false
       }
     });
@@ -841,45 +858,47 @@ app.post('/api/custom-form', async (req: Request, res: Response) => {
     }
 
     const idempKey = (idempotencyKey || submissionId || req.headers['x-idempotency-key'] || '') as string;
-    if (idempKey) {
-      const existing = await dataStore.findCustomSubmissionByIdempotency(idempKey, check.project!.id);
-      if (existing) {
-        return res.status(200).json({
-          success: true,
-          id: existing.id,
-          message: 'Custom submission already recorded (idempotent replay).',
-          data: { submissionId: existing.id, idempotentReplay: true }
-        });
+
+    const { isReplay, submission } = await dataStore.atomicCreateCustomSubmission(
+      check.project!.id,
+      idempKey || undefined,
+      () => {
+        const subId = 'csub-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
+        return {
+          id: subId,
+          submissionId: idempKey || subId,
+          idempotencyKey: idempKey || undefined,
+          projectId: check.project!.id,
+          landingPageId: check.landingPage!.id,
+          formId: check.form!.id,
+          data: sanitizeObject(data || {}),
+          utmSource: utmSource ? sanitizeString(utmSource) : undefined,
+          utmMedium: utmMedium ? sanitizeString(utmMedium) : undefined,
+          utmCampaign: utmCampaign ? sanitizeString(utmCampaign) : undefined,
+          utmContent: utmContent ? sanitizeString(utmContent) : undefined,
+          utmTerm: utmTerm ? sanitizeString(utmTerm) : undefined,
+          referrer: referrer ? sanitizeString(referrer) : undefined,
+          visitorId: visitorId ? sanitizeString(visitorId) : undefined,
+          sessionId: sessionId ? sanitizeString(sessionId) : undefined,
+          firstTouch: firstTouch ? sanitizeObject(firstTouch) : undefined,
+          lastTouch: lastTouch ? sanitizeObject(lastTouch) : undefined,
+          createdAt: new Date().toISOString()
+        };
       }
+    );
+
+    if (isReplay) {
+      return res.status(200).json({
+        success: true,
+        id: submission.id,
+        message: 'Custom submission already recorded (idempotent replay).',
+        data: { submissionId: submission.id, idempotentReplay: true }
+      });
     }
-
-    const subId = 'csub-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
-    const submission: CustomSubmission = {
-      id: subId,
-      submissionId: idempKey || subId,
-      idempotencyKey: idempKey || undefined,
-      projectId: check.project!.id,
-      landingPageId: check.landingPage!.id,
-      formId: check.form!.id,
-      data: sanitizeObject(data || {}),
-      utmSource: utmSource ? sanitizeString(utmSource) : undefined,
-      utmMedium: utmMedium ? sanitizeString(utmMedium) : undefined,
-      utmCampaign: utmCampaign ? sanitizeString(utmCampaign) : undefined,
-      utmContent: utmContent ? sanitizeString(utmContent) : undefined,
-      utmTerm: utmTerm ? sanitizeString(utmTerm) : undefined,
-      referrer: referrer ? sanitizeString(referrer) : undefined,
-      visitorId: visitorId ? sanitizeString(visitorId) : undefined,
-      sessionId: sessionId ? sanitizeString(sessionId) : undefined,
-      firstTouch: firstTouch ? sanitizeObject(firstTouch) : undefined,
-      lastTouch: lastTouch ? sanitizeObject(lastTouch) : undefined,
-      createdAt: new Date().toISOString()
-    };
-
-    await dataStore.createCustomSubmission(submission);
 
     return res.status(201).json({
       success: true,
-      id: subId,
+      id: submission.id,
       message: 'Custom form submission recorded.'
     });
   } catch (error: any) {

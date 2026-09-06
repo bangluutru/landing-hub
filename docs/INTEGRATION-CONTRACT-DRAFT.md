@@ -16,8 +16,8 @@
    Any mismatch or inactive state results in a `400 Bad Request` with a typed error code.
 3. **Origin Whitelisting**:
    Public endpoints validate the `Origin` or `Referer` against registered project domains (`project.allowedDomains`) or the landing page URL (`landingPage.url`). Untrusted origins receive a `403 Forbidden`. Localhost is permitted in non-production environments.
-4. **Idempotency & Deduplication**:
-   Submissions support an `idempotencyKey` / `submissionId`. Duplicate submissions (e.g. user double-clicks or network retries) return the existing record (`200 OK` with `idempotentReplay: true`) without creating duplicate entities or duplicate funnel events.
+4. **Atomic Backend Idempotency & Deduplication**:
+   Submissions support an `idempotencyKey` / `submissionId`. The backend enforces concurrency-safe atomicity via Cloud Firestore transactions and deterministic reservation documents (`idempotency/res_<sha256>`), composite-keyed by `projectId + entityType + idempotencyKey`. Concurrent submissions with identical keys result in exactly one created entity. Duplicate submissions or retries return the existing record (`200 OK` with `idempotentReplay: true`) without creating duplicate entities or duplicate conversion events (`order_created`, `form_submit`).
 5. **Order Integrity (Unverified Revenue)**:
    Client-reported prices and totals are marked as unverified (`verifiedRevenue: false`). The server records both `clientReportedSubtotal` / `clientReportedTotal` and computes `serverCalculatedSubtotal`. Server catalog verification is deferred to future catalog services.
 6. **Separation of Conversion Semantics**:
@@ -248,8 +248,29 @@
 3. Stores `lastTouch` in `localStorage['_lphub_lt']` (updated whenever new UTM campaigns arrive).
 4. For all subsequent navigations or form submissions where URL parameters might be lost, SDK falls back to stored attribution context, ensuring zero attribution loss.
 
-### 5.3. Idempotency Key Generation
-The SDK automatically generates unique idempotency keys (`ik_lead_*`, `ik_ord_*`, `ik_csub_*`) if not explicitly passed by the caller. Callers may also provide a custom `idempotencyKey` or `submissionId`.
+### 5.3. Submission Identity & Double-Submit Protection
+
+The SDK enforces the principle: **One logical form submission = one stable `submissionId` / `idempotencyKey`**.
+
+1. **Submission Key Persistence & Lifecycle**:
+   - The key is generated when a form submission starts (`ik_lead_*`, `ik_ord_*`, `ik_csub_*`) and bound to the active `formId`.
+   - On in-flight double-clicks: If `submitOrder`, `submitLead`, or `submitCustomForm` is triggered while an earlier submission is still pending, the SDK detects the in-flight promise and directly joins it, preventing duplicate network requests.
+   - On failure (network error or server 4xx/5xx): The active submission key is preserved in the SDK session. Subsequent user retries reuse the exact same key, allowing the backend atomic reservation engine to safely recognize and deduplicate previously committed requests.
+   - On success (`res.success === true`): The active submission session is cleared. Any subsequent submission on that form generates a fresh key, creating a brand new entity.
+
+2. **Explicit Submission Session API (`createSubmission`)**:
+   - For custom or multi-step checkout flows needing explicit lifecycle control:
+   ```javascript
+   const session = LPHub.createSubmission('abano-order-form-01');
+   // All calls through this session instance share session.submissionId
+   await session.submitOrder({ ... });
+   ```
+
+3. **Recommended Frontend UX Integration**:
+   ```
+   [User Clicks Submit] -> Disable Button -> Await SDK Promise -> Success (Show Thank You) OR Error (Re-enable Button for Retry)
+   ```
+   *Note: While frontend button disabling provides good UX, backend atomic Firestore reservations guarantee idempotency independently of the client UI state.*
 
 ---
 
@@ -259,6 +280,14 @@ Admin endpoints require an HTTP `Authorization` header:
 ```http
 Authorization: Bearer <Firebase_ID_Token>
 ```
+
+### Production Security & Fail-Closed Guardrails
+1. **Production Mode (`NODE_ENV=production`)**:
+   - **Only** valid Firebase Authentication ID tokens verified via Firebase Admin SDK (`adminAuth.verifyIdToken`) are accepted.
+   - Any token starting with `demo-*` or `test-*` is strictly rejected with `401 Unauthorized` (`UNAUTHORIZED`).
+2. **Non-Production Environments (Local / Testing)**:
+   - `demo-*` and `test-*` tokens are permitted **only** when `ALLOW_TEST_TOKENS=true` is explicitly configured in the environment AND `NODE_ENV !== 'production'`.
+   - If `ALLOW_TEST_TOKENS` is omitted or false, the system **fails closed**, returning `401 Unauthorized`.
 
 ### Role Matrix
 

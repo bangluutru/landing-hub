@@ -11,6 +11,7 @@
     this.sessionId = '';
     this.firstTouch = null;
     this.lastTouch = null;
+    this.activeSubmissions = {};
     this.initStorage();
   }
 
@@ -172,71 +173,180 @@
     return this._post('/api/track', payload);
   };
 
+  /**
+   * Internal submission execution engine:
+   * 1. Reuses stable idempotencyKey/submissionId for the active logical submission of formId.
+   * 2. If a submission is currently in-flight, returns the existing promise to prevent double-submit.
+   * 3. On failure (network error or backend error), preserves the key so retry reuses it.
+   * 4. On success, deletes the active session so the next submission gets a fresh key.
+   */
+  LPHubClient.prototype._executeSubmission = function (formId, typePrefix, explicitKey, requestExecutor) {
+    var self = this;
+    var formKey = formId || 'default_form';
+
+    // 1. In-flight double-submit prevention
+    var existingSession = self.activeSubmissions[formKey];
+    if (existingSession && existingSession.inFlightPromise && !explicitKey) {
+      if (self.config && self.config.debug) {
+        console.warn('[LPHub SDK] In-flight submission detected for form \'' + formKey + '\'. Joining existing request.');
+      }
+      return existingSession.inFlightPromise;
+    }
+
+    // 2. Resolve or create stable key for this logical submission
+    var isExplicit = Boolean(explicitKey);
+    var idempKey = explicitKey;
+    if (!idempKey) {
+      if (!existingSession) {
+        idempKey = self._generateIdempotencyKey(typePrefix);
+        self.activeSubmissions[formKey] = { submissionId: idempKey };
+      } else {
+        idempKey = existingSession.submissionId;
+      }
+    }
+
+    // 3. Execute request and track in-flight status
+    var submissionPromise = requestExecutor(idempKey).then(function (response) {
+      if (response && response.success && !isExplicit) {
+        delete self.activeSubmissions[formKey];
+      }
+      var current = self.activeSubmissions[formKey];
+      if (current) {
+        current.inFlightPromise = undefined;
+      }
+      return response;
+    }).catch(function (err) {
+      var current = self.activeSubmissions[formKey];
+      if (current) {
+        current.inFlightPromise = undefined;
+      }
+      throw err;
+    });
+
+    if (!isExplicit && self.activeSubmissions[formKey]) {
+      self.activeSubmissions[formKey].inFlightPromise = submissionPromise;
+    }
+
+    return submissionPromise;
+  };
+
+  /**
+   * Explicit Submission Session factory for manual lifecycle management.
+   */
+  LPHubClient.prototype.createSubmission = function (formId) {
+    var self = this;
+    var sessionKey = self._generateIdempotencyKey('sub');
+    return {
+      submissionId: sessionKey,
+      idempotencyKey: sessionKey,
+      submitLead: function (payload) {
+        return self.submitLead(Object.assign({}, payload, {
+          formId: (payload && payload.formId) || formId,
+          submissionId: sessionKey,
+          idempotencyKey: sessionKey
+        }));
+      },
+      submitOrder: function (payload) {
+        return self.submitOrder(Object.assign({}, payload, {
+          formId: (payload && payload.formId) || formId,
+          submissionId: sessionKey,
+          idempotencyKey: sessionKey
+        }));
+      },
+      submitCustomForm: function (payload) {
+        return self.submitCustomForm(Object.assign({}, payload, {
+          formId: (payload && payload.formId) || formId,
+          submissionId: sessionKey,
+          idempotencyKey: sessionKey
+        }));
+      },
+      reset: function () {
+        self.resetSubmission(formId);
+      }
+    };
+  };
+
+  /**
+   * Reset active submission session for a given formId.
+   */
+  LPHubClient.prototype.resetSubmission = function (formId) {
+    delete this.activeSubmissions[formId || 'default_form'];
+  };
+
   LPHubClient.prototype.submitLead = function (payload) {
     if (!this.config) {
       return Promise.resolve({ success: false, error: { code: 'NOT_INITIALIZED', message: 'SDK not initialized' } });
     }
+    var self = this;
     var ctx = this.getUtmAndContext();
     var data = payload.data || {};
     var name = payload.name || data.name || data.fullname || data.fullName;
     var phone = payload.phone || data.phone || data.phoneNumber;
     var email = payload.email || data.email;
-    var idempKey = payload.idempotencyKey || payload.submissionId || this._generateIdempotencyKey('lead');
+    var explicitKey = payload.idempotencyKey || payload.submissionId;
 
-    var body = Object.assign({}, ctx, {
-      projectId: this.config.projectId,
-      landingPageId: this.config.landingPageId,
-      formId: payload.formId,
-      submissionId: idempKey,
-      idempotencyKey: idempKey,
-      name: name,
-      phone: phone,
-      email: email,
-      data: data
+    return this._executeSubmission(payload.formId, 'lead', explicitKey, function (key) {
+      var body = Object.assign({}, ctx, {
+        projectId: self.config.projectId,
+        landingPageId: self.config.landingPageId,
+        formId: payload.formId,
+        submissionId: key,
+        idempotencyKey: key,
+        name: name,
+        phone: phone,
+        email: email,
+        data: data
+      });
+      return self._post('/api/lead', body);
     });
-    return this._post('/api/lead', body);
   };
 
   LPHubClient.prototype.submitOrder = function (payload) {
     if (!this.config) {
       return Promise.resolve({ success: false, error: { code: 'NOT_INITIALIZED', message: 'SDK not initialized' } });
     }
+    var self = this;
     var ctx = this.getUtmAndContext();
-    var idempKey = payload.idempotencyKey || payload.submissionId || this._generateIdempotencyKey('ord');
+    var explicitKey = payload.idempotencyKey || payload.submissionId;
 
-    var body = Object.assign({}, ctx, {
-      projectId: this.config.projectId,
-      landingPageId: this.config.landingPageId,
-      formId: payload.formId,
-      submissionId: idempKey,
-      idempotencyKey: idempKey,
-      customer: payload.customer,
-      items: payload.items || [],
-      subtotal: payload.subtotal != null ? payload.subtotal : payload.total,
-      total: payload.total,
-      currency: payload.currency || 'VND',
-      paymentMethod: payload.paymentMethod || 'cod',
-      data: payload.data || {}
+    return this._executeSubmission(payload.formId, 'ord', explicitKey, function (key) {
+      var body = Object.assign({}, ctx, {
+        projectId: self.config.projectId,
+        landingPageId: self.config.landingPageId,
+        formId: payload.formId,
+        submissionId: key,
+        idempotencyKey: key,
+        customer: payload.customer,
+        items: payload.items || [],
+        subtotal: payload.subtotal != null ? payload.subtotal : payload.total,
+        total: payload.total,
+        currency: payload.currency || 'VND',
+        paymentMethod: payload.paymentMethod || 'cod',
+        data: payload.data || {}
+      });
+      return self._post('/api/order', body);
     });
-    return this._post('/api/order', body);
   };
 
   LPHubClient.prototype.submitCustomForm = function (payload) {
     if (!this.config) {
       return Promise.resolve({ success: false, error: { code: 'NOT_INITIALIZED', message: 'SDK not initialized' } });
     }
+    var self = this;
     var ctx = this.getUtmAndContext();
-    var idempKey = payload.idempotencyKey || payload.submissionId || this._generateIdempotencyKey('csub');
+    var explicitKey = payload.idempotencyKey || payload.submissionId;
 
-    var body = Object.assign({}, ctx, {
-      projectId: this.config.projectId,
-      landingPageId: this.config.landingPageId,
-      formId: payload.formId,
-      submissionId: idempKey,
-      idempotencyKey: idempKey,
-      data: payload.data || {}
+    return this._executeSubmission(payload.formId, 'csub', explicitKey, function (key) {
+      var body = Object.assign({}, ctx, {
+        projectId: self.config.projectId,
+        landingPageId: self.config.landingPageId,
+        formId: payload.formId,
+        submissionId: key,
+        idempotencyKey: key,
+        data: payload.data || {}
+      });
+      return self._post('/api/custom-form', body);
     });
-    return this._post('/api/custom-form', body);
   };
 
   LPHubClient.prototype._post = function (endpoint, body) {

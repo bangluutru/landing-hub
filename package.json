@@ -10,7 +10,7 @@
     "server": "tsx server/src/index.ts",
     "dev:all": "concurrently \"npm run dev\" \"npm run server\"",
     "typecheck": "tsc --noEmit",
-    "test": "NODE_ENV=test USE_FIRESTORE_MEMORY_STUB=true tsx --test tests/**/*.test.ts"
+    "test": "NODE_ENV=test ALLOW_TEST_TOKENS=true USE_FIRESTORE_MEMORY_STUB=true tsx --test tests/**/*.test.ts"
   },
   "dependencies": {
     "clsx": "^2.1.1",

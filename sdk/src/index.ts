@@ -80,12 +80,22 @@ export interface ApiResponse<T = any> {
   };
 }
 
+export interface SubmissionSession {
+  submissionId: string;
+  idempotencyKey: string;
+  submitLead(payload: Omit<LeadSubmissionPayload, 'formId' | 'idempotencyKey' | 'submissionId'> & { formId?: string }): Promise<ApiResponse>;
+  submitOrder(payload: Omit<OrderSubmissionPayload, 'formId' | 'idempotencyKey' | 'submissionId'> & { formId?: string }): Promise<ApiResponse>;
+  submitCustomForm(payload: Omit<CustomFormPayload, 'formId' | 'idempotencyKey' | 'submissionId'> & { formId?: string }): Promise<ApiResponse>;
+  reset(): void;
+}
+
 class LPHubClient {
   private config: LPHubConfig | null = null;
   private visitorId: string = '';
   private sessionId: string = '';
   private firstTouch: AttributionTouch | null = null;
   private lastTouch: AttributionTouch | null = null;
+  private activeSubmissions = new Map<string, { submissionId: string; inFlightPromise?: Promise<ApiResponse> }>();
 
   constructor() {
     this.initStorage();
@@ -274,6 +284,111 @@ class LPHubClient {
     return this.postJson('/api/track', payload);
   }
 
+  /**
+   * Internal submission execution engine:
+   * 1. Reuses stable idempotencyKey/submissionId for the active logical submission of formId.
+   * 2. If a submission is currently in-flight, returns the existing promise to prevent double-submit.
+   * 3. On failure (network error or backend error), preserves the key so retry reuses it.
+   * 4. On success, deletes the active session so the next submission gets a fresh key.
+   */
+  private async executeSubmission(
+    formId: string,
+    typePrefix: string,
+    explicitKey: string | undefined,
+    requestExecutor: (key: string) => Promise<ApiResponse>
+  ): Promise<ApiResponse> {
+    const formKey = formId || 'default_form';
+
+    // 1. In-flight double-submit prevention
+    const existingSession = this.activeSubmissions.get(formKey);
+    if (existingSession?.inFlightPromise && !explicitKey) {
+      if (this.config?.debug) {
+        console.warn(`[LPHub SDK] In-flight submission detected for form '${formKey}'. Joining existing request.`);
+      }
+      return existingSession.inFlightPromise;
+    }
+
+    // 2. Resolve or create stable key for this logical submission
+    const isExplicit = Boolean(explicitKey);
+    let idempKey = explicitKey;
+    if (!idempKey) {
+      if (!existingSession) {
+        idempKey = this.generateIdempotencyKey(typePrefix);
+        this.activeSubmissions.set(formKey, { submissionId: idempKey });
+      } else {
+        idempKey = existingSession.submissionId;
+      }
+    }
+
+    // 3. Execute request and track in-flight status
+    const submissionPromise = (async () => {
+      try {
+        const response = await requestExecutor(idempKey!);
+        if (response.success && !isExplicit) {
+          // Success: clear session so subsequent logical submission gets a new key
+          this.activeSubmissions.delete(formKey);
+        }
+        return response;
+      } finally {
+        const current = this.activeSubmissions.get(formKey);
+        if (current) {
+          current.inFlightPromise = undefined;
+        }
+      }
+    })();
+
+    if (!isExplicit) {
+      const current = this.activeSubmissions.get(formKey);
+      if (current) {
+        current.inFlightPromise = submissionPromise;
+      }
+    }
+
+    return submissionPromise;
+  }
+
+  /**
+   * Explicit Submission Session factory for manual lifecycle management.
+   */
+  public createSubmission(formId: string): SubmissionSession {
+    const sessionKey = this.generateIdempotencyKey('sub');
+    return {
+      submissionId: sessionKey,
+      idempotencyKey: sessionKey,
+      submitLead: (payload) =>
+        this.submitLead({
+          ...payload,
+          formId: payload.formId || formId,
+          submissionId: sessionKey,
+          idempotencyKey: sessionKey
+        }),
+      submitOrder: (payload) =>
+        this.submitOrder({
+          ...payload,
+          formId: payload.formId || formId,
+          submissionId: sessionKey,
+          idempotencyKey: sessionKey
+        }),
+      submitCustomForm: (payload) =>
+        this.submitCustomForm({
+          ...payload,
+          formId: payload.formId || formId,
+          submissionId: sessionKey,
+          idempotencyKey: sessionKey
+        }),
+      reset: () => {
+        this.resetSubmission(formId);
+      }
+    };
+  }
+
+  /**
+   * Reset active submission session for a given formId.
+   */
+  public resetSubmission(formId: string): void {
+    this.activeSubmissions.delete(formId || 'default_form');
+  }
+
   public async submitLead(payload: LeadSubmissionPayload): Promise<ApiResponse> {
     const config = this.ensureConfigured();
     const context = this.getUtmAndContext();
@@ -282,66 +397,67 @@ class LPHubClient {
     const name = payload.name || data.name || data.fullname || data.fullName;
     const phone = payload.phone || data.phone || data.phoneNumber;
     const email = payload.email || data.email;
-    const idempKey = payload.idempotencyKey || payload.submissionId || this.generateIdempotencyKey('lead');
+    const explicitKey = payload.idempotencyKey || payload.submissionId;
 
-    const requestBody = {
-      projectId: config.projectId,
-      landingPageId: config.landingPageId,
-      formId: payload.formId,
-      submissionId: idempKey,
-      idempotencyKey: idempKey,
-      name,
-      phone,
-      email,
-      data,
-      ...context
-    };
-
-    return this.postJson('/api/lead', requestBody);
+    return this.executeSubmission(payload.formId, 'lead', explicitKey, (key) => {
+      const requestBody = {
+        projectId: config.projectId,
+        landingPageId: config.landingPageId,
+        formId: payload.formId,
+        submissionId: key,
+        idempotencyKey: key,
+        name,
+        phone,
+        email,
+        data,
+        ...context
+      };
+      return this.postJson('/api/lead', requestBody);
+    });
   }
 
   public async submitOrder(payload: OrderSubmissionPayload): Promise<ApiResponse> {
     const config = this.ensureConfigured();
     const context = this.getUtmAndContext();
+    const explicitKey = payload.idempotencyKey || payload.submissionId;
 
-    const idempKey = payload.idempotencyKey || payload.submissionId || this.generateIdempotencyKey('ord');
-
-    const requestBody = {
-      projectId: config.projectId,
-      landingPageId: config.landingPageId,
-      formId: payload.formId,
-      submissionId: idempKey,
-      idempotencyKey: idempKey,
-      customer: payload.customer,
-      items: payload.items,
-      subtotal: payload.subtotal ?? payload.total,
-      total: payload.total,
-      currency: payload.currency || 'VND',
-      paymentMethod: payload.paymentMethod || 'cod',
-      data: payload.data || {},
-      ...context
-    };
-
-    return this.postJson('/api/order', requestBody);
+    return this.executeSubmission(payload.formId, 'ord', explicitKey, (key) => {
+      const requestBody = {
+        projectId: config.projectId,
+        landingPageId: config.landingPageId,
+        formId: payload.formId,
+        submissionId: key,
+        idempotencyKey: key,
+        customer: payload.customer,
+        items: payload.items,
+        subtotal: payload.subtotal ?? payload.total,
+        total: payload.total,
+        currency: payload.currency || 'VND',
+        paymentMethod: payload.paymentMethod || 'cod',
+        data: payload.data || {},
+        ...context
+      };
+      return this.postJson('/api/order', requestBody);
+    });
   }
 
   public async submitCustomForm(payload: CustomFormPayload): Promise<ApiResponse> {
     const config = this.ensureConfigured();
     const context = this.getUtmAndContext();
+    const explicitKey = payload.idempotencyKey || payload.submissionId;
 
-    const idempKey = payload.idempotencyKey || payload.submissionId || this.generateIdempotencyKey('csub');
-
-    const requestBody = {
-      projectId: config.projectId,
-      landingPageId: config.landingPageId,
-      formId: payload.formId,
-      submissionId: idempKey,
-      idempotencyKey: idempKey,
-      data: payload.data,
-      ...context
-    };
-
-    return this.postJson('/api/custom-form', requestBody);
+    return this.executeSubmission(payload.formId, 'csub', explicitKey, (key) => {
+      const requestBody = {
+        projectId: config.projectId,
+        landingPageId: config.landingPageId,
+        formId: payload.formId,
+        submissionId: key,
+        idempotencyKey: key,
+        data: payload.data,
+        ...context
+      };
+      return this.postJson('/api/custom-form', requestBody);
+    });
   }
 
   private async postJson(endpoint: string, data: any): Promise<ApiResponse> {

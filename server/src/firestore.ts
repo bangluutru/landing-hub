@@ -1,6 +1,7 @@
 import { initializeApp, getApps, App } from 'firebase-admin/app';
 import { getFirestore, Firestore, FieldValue } from 'firebase-admin/firestore';
 import { getAuth, Auth } from 'firebase-admin/auth';
+import crypto from 'crypto';
 import {
   Project,
   LandingPage,
@@ -28,6 +29,17 @@ if (getApps().length === 0) {
 
 export const adminAuth: Auth = getAuth(adminApp);
 export const firestoreDb: Firestore = getFirestore(adminApp);
+
+/**
+ * Deterministic Idempotency Key Generator:
+ * Scoped by projectId + entityType + idempotencyKey.
+ * Uses SHA-256 hex digest to avoid invalid Firestore ID characters and prevent exposing sensitive data.
+ */
+export function getReservationId(projectId: string, entityType: 'lead' | 'order' | 'custom', idempotencyKey: string): string {
+  const raw = `${projectId.trim().toLowerCase()}:${entityType}:${idempotencyKey.trim()}`;
+  const hash = crypto.createHash('sha256').update(raw).digest('hex');
+  return `res_${hash}`;
+}
 
 // Standard Seed Data (Written directly to Firestore, not filesystem)
 export const INITIAL_SEED_DATA = {
@@ -428,11 +440,30 @@ export interface DataStore {
   createEvent(event: TrackingEvent): Promise<TrackingEvent>;
   getUser(uid: string): Promise<AdminUser | null>;
   resetSeed(): Promise<void>;
+
+  // Atomic Idempotency Reservation APIs
+  atomicCreateOrder(
+    projectId: string,
+    idempotencyKey: string | undefined,
+    orderFactory: () => Order
+  ): Promise<{ isReplay: boolean; order: Order }>;
+
+  atomicCreateLead(
+    projectId: string,
+    idempotencyKey: string | undefined,
+    leadFactory: () => Lead
+  ): Promise<{ isReplay: boolean; lead: Lead }>;
+
+  atomicCreateCustomSubmission(
+    projectId: string,
+    idempotencyKey: string | undefined,
+    submissionFactory: () => CustomSubmission
+  ): Promise<{ isReplay: boolean; submission: CustomSubmission }>;
 }
 
 /**
  * Cloud Firestore Implementation
- * Uses Cloud Firestore collections via Firebase Admin SDK.
+ * Uses Cloud Firestore collections via Firebase Admin SDK with transactional idempotency reservations.
  */
 class FirestoreDataStore implements DataStore {
   private db = firestoreDb;
@@ -446,7 +477,6 @@ class FirestoreDataStore implements DataStore {
     const doc = await this.db.collection('projects').doc(id).get();
     if (doc.exists) return doc.data() as Project;
 
-    // Also fallback query by code
     const querySnap = await this.db.collection('projects').where('code', '==', id.toUpperCase()).limit(1).get();
     if (!querySnap.empty) return querySnap.docs[0].data() as Project;
 
@@ -524,7 +554,6 @@ class FirestoreDataStore implements DataStore {
       .get();
     if (!snap.empty) return snap.docs[0].data() as Lead;
 
-    // Fallback check on submissionId
     const snapSub = await this.db
       .collection('leads')
       .where('projectId', '==', projectId)
@@ -628,10 +657,136 @@ class FirestoreDataStore implements DataStore {
     return null;
   }
 
+  async atomicCreateOrder(
+    projectId: string,
+    idempotencyKey: string | undefined,
+    orderFactory: () => Order
+  ): Promise<{ isReplay: boolean; order: Order }> {
+    if (!idempotencyKey) {
+      const order = orderFactory();
+      await this.createOrder(order);
+      return { isReplay: false, order };
+    }
+
+    const resId = getReservationId(projectId, 'order', idempotencyKey);
+    const resRef = this.db.collection('idempotency').doc(resId);
+
+    return await this.db.runTransaction(async (transaction) => {
+      const resDoc = await transaction.get(resRef);
+      if (resDoc.exists) {
+        const data = resDoc.data();
+        if (data?.status === 'completed' && data?.entityId) {
+          const existingDoc = await transaction.get(this.db.collection('orders').doc(data.entityId));
+          if (existingDoc.exists) {
+            return { isReplay: true, order: existingDoc.data() as Order };
+          }
+        }
+      }
+
+      const newOrder = orderFactory();
+      transaction.set(this.db.collection('orders').doc(newOrder.id), newOrder);
+      transaction.set(resRef, {
+        id: resId,
+        projectId,
+        entityType: 'order',
+        idempotencyKey,
+        entityId: newOrder.id,
+        humanId: newOrder.orderId,
+        status: 'completed',
+        createdAt: new Date().toISOString()
+      });
+
+      return { isReplay: false, order: newOrder };
+    });
+  }
+
+  async atomicCreateLead(
+    projectId: string,
+    idempotencyKey: string | undefined,
+    leadFactory: () => Lead
+  ): Promise<{ isReplay: boolean; lead: Lead }> {
+    if (!idempotencyKey) {
+      const lead = leadFactory();
+      await this.createLead(lead);
+      return { isReplay: false, lead };
+    }
+
+    const resId = getReservationId(projectId, 'lead', idempotencyKey);
+    const resRef = this.db.collection('idempotency').doc(resId);
+
+    return await this.db.runTransaction(async (transaction) => {
+      const resDoc = await transaction.get(resRef);
+      if (resDoc.exists) {
+        const data = resDoc.data();
+        if (data?.status === 'completed' && data?.entityId) {
+          const existingDoc = await transaction.get(this.db.collection('leads').doc(data.entityId));
+          if (existingDoc.exists) {
+            return { isReplay: true, lead: existingDoc.data() as Lead };
+          }
+        }
+      }
+
+      const newLead = leadFactory();
+      transaction.set(this.db.collection('leads').doc(newLead.id), newLead);
+      transaction.set(resRef, {
+        id: resId,
+        projectId,
+        entityType: 'lead',
+        idempotencyKey,
+        entityId: newLead.id,
+        status: 'completed',
+        createdAt: new Date().toISOString()
+      });
+
+      return { isReplay: false, lead: newLead };
+    });
+  }
+
+  async atomicCreateCustomSubmission(
+    projectId: string,
+    idempotencyKey: string | undefined,
+    submissionFactory: () => CustomSubmission
+  ): Promise<{ isReplay: boolean; submission: CustomSubmission }> {
+    if (!idempotencyKey) {
+      const sub = submissionFactory();
+      await this.createCustomSubmission(sub);
+      return { isReplay: false, submission: sub };
+    }
+
+    const resId = getReservationId(projectId, 'custom', idempotencyKey);
+    const resRef = this.db.collection('idempotency').doc(resId);
+
+    return await this.db.runTransaction(async (transaction) => {
+      const resDoc = await transaction.get(resRef);
+      if (resDoc.exists) {
+        const data = resDoc.data();
+        if (data?.status === 'completed' && data?.entityId) {
+          const existingDoc = await transaction.get(this.db.collection('customSubmissions').doc(data.entityId));
+          if (existingDoc.exists) {
+            return { isReplay: true, submission: existingDoc.data() as CustomSubmission };
+          }
+        }
+      }
+
+      const newSub = submissionFactory();
+      transaction.set(this.db.collection('customSubmissions').doc(newSub.id), newSub);
+      transaction.set(resRef, {
+        id: resId,
+        projectId,
+        entityType: 'custom',
+        idempotencyKey,
+        entityId: newSub.id,
+        status: 'completed',
+        createdAt: new Date().toISOString()
+      });
+
+      return { isReplay: false, submission: newSub };
+    });
+  }
+
   async resetSeed(): Promise<void> {
     const batch = this.db.batch();
 
-    // Clear existing or write seed
     for (const p of INITIAL_SEED_DATA.projects) {
       batch.set(this.db.collection('projects').doc(p.id), p);
     }
@@ -660,7 +815,7 @@ class FirestoreDataStore implements DataStore {
 
 /**
  * In-Memory DataStore implementation
- * Used purely for hermetic offline testing when no Firestore credentials or emulator are configured.
+ * Used for hermetic offline testing with concurrent reservation locks.
  * Does NOT touch filesystem.
  */
 class MemoryDataStore implements DataStore {
@@ -672,6 +827,10 @@ class MemoryDataStore implements DataStore {
   private customSubmissions: CustomSubmission[] = [];
   private events: TrackingEvent[] = [];
   private users: AdminUser[] = [];
+
+  // Idempotency registry and concurrency mutexes for testing race conditions
+  private idempotencyRegistry = new Map<string, { entityId: string; record: any }>();
+  private inFlightLocks = new Map<string, Promise<any>>();
 
   constructor() {
     this.resetSeedSync();
@@ -686,6 +845,8 @@ class MemoryDataStore implements DataStore {
     this.customSubmissions = [];
     this.events = JSON.parse(JSON.stringify(INITIAL_SEED_DATA.events));
     this.users = JSON.parse(JSON.stringify(INITIAL_SEED_DATA.users));
+    this.idempotencyRegistry.clear();
+    this.inFlightLocks.clear();
   }
 
   async getProjects(): Promise<Project[]> {
@@ -812,14 +973,132 @@ class MemoryDataStore implements DataStore {
     return this.users.find(u => u.uid === uid) || null;
   }
 
+  async atomicCreateOrder(
+    projectId: string,
+    idempotencyKey: string | undefined,
+    orderFactory: () => Order
+  ): Promise<{ isReplay: boolean; order: Order }> {
+    if (!idempotencyKey) {
+      const order = orderFactory();
+      this.orders.unshift(order);
+      return { isReplay: false, order };
+    }
+
+    const resId = getReservationId(projectId, 'order', idempotencyKey);
+
+    // Mutual exclusion lock for concurrent calls
+    while (this.inFlightLocks.has(resId)) {
+      await this.inFlightLocks.get(resId);
+    }
+
+    // Check if already reserved and created
+    if (this.idempotencyRegistry.has(resId)) {
+      const existing = this.idempotencyRegistry.get(resId)!;
+      return { isReplay: true, order: existing.record as Order };
+    }
+
+    // Acquire lock
+    let resolveLock!: () => void;
+    const lockPromise = new Promise<void>((resolve) => {
+      resolveLock = resolve;
+    });
+    this.inFlightLocks.set(resId, lockPromise);
+
+    try {
+      const order = orderFactory();
+      this.orders.unshift(order);
+      this.idempotencyRegistry.set(resId, { entityId: order.id, record: order });
+      return { isReplay: false, order };
+    } finally {
+      this.inFlightLocks.delete(resId);
+      resolveLock();
+    }
+  }
+
+  async atomicCreateLead(
+    projectId: string,
+    idempotencyKey: string | undefined,
+    leadFactory: () => Lead
+  ): Promise<{ isReplay: boolean; lead: Lead }> {
+    if (!idempotencyKey) {
+      const lead = leadFactory();
+      this.leads.unshift(lead);
+      return { isReplay: false, lead };
+    }
+
+    const resId = getReservationId(projectId, 'lead', idempotencyKey);
+
+    while (this.inFlightLocks.has(resId)) {
+      await this.inFlightLocks.get(resId);
+    }
+
+    if (this.idempotencyRegistry.has(resId)) {
+      const existing = this.idempotencyRegistry.get(resId)!;
+      return { isReplay: true, lead: existing.record as Lead };
+    }
+
+    let resolveLock!: () => void;
+    const lockPromise = new Promise<void>((resolve) => {
+      resolveLock = resolve;
+    });
+    this.inFlightLocks.set(resId, lockPromise);
+
+    try {
+      const lead = leadFactory();
+      this.leads.unshift(lead);
+      this.idempotencyRegistry.set(resId, { entityId: lead.id, record: lead });
+      return { isReplay: false, lead };
+    } finally {
+      this.inFlightLocks.delete(resId);
+      resolveLock();
+    }
+  }
+
+  async atomicCreateCustomSubmission(
+    projectId: string,
+    idempotencyKey: string | undefined,
+    submissionFactory: () => CustomSubmission
+  ): Promise<{ isReplay: boolean; submission: CustomSubmission }> {
+    if (!idempotencyKey) {
+      const sub = submissionFactory();
+      this.customSubmissions.unshift(sub);
+      return { isReplay: false, submission: sub };
+    }
+
+    const resId = getReservationId(projectId, 'custom', idempotencyKey);
+
+    while (this.inFlightLocks.has(resId)) {
+      await this.inFlightLocks.get(resId);
+    }
+
+    if (this.idempotencyRegistry.has(resId)) {
+      const existing = this.idempotencyRegistry.get(resId)!;
+      return { isReplay: true, submission: existing.record as CustomSubmission };
+    }
+
+    let resolveLock!: () => void;
+    const lockPromise = new Promise<void>((resolve) => {
+      resolveLock = resolve;
+    });
+    this.inFlightLocks.set(resId, lockPromise);
+
+    try {
+      const sub = submissionFactory();
+      this.customSubmissions.unshift(sub);
+      this.idempotencyRegistry.set(resId, { entityId: sub.id, record: sub });
+      return { isReplay: false, submission: sub };
+    } finally {
+      this.inFlightLocks.delete(resId);
+      resolveLock();
+    }
+  }
+
   async resetSeed(): Promise<void> {
     this.resetSeedSync();
   }
 }
 
 // Select datastore implementation:
-// In test environments or when explicitly instructed via USE_FIRESTORE_MEMORY_STUB without emulator,
-// use MemoryDataStore. Otherwise use real FirestoreDataStore.
 const useMemoryStub =
   process.env.USE_FIRESTORE_MEMORY_STUB === 'true' ||
   (process.env.NODE_ENV === 'test' && !process.env.FIRESTORE_EMULATOR_HOST && !process.env.USE_LIVE_FIRESTORE);

@@ -17,11 +17,13 @@ This document provides the exhaustive technical reference for all public ingesti
 
 ### 1.2. Public Ingestion Security (CORS & Origin Whitelisting)
 All ingestion requests (`/api/track`, `/api/lead`, `/api/order`, `/api/custom-form`) enforce origin validation:
-- The request `Origin` or `Referer` header is matched against:
+- **Browser production requests SHOULD provide `Origin` or `Referer`**.
+- If the header is present, Landing Hub validates the domain against:
   1. The registered `landingPage.url` hostname.
   2. The registered domain list `project.allowedDomains`.
   3. `localhost` / `127.0.0.1` (permitted only in non-production environments).
-- If the origin does not match, the request is rejected immediately:
+- **Requests without `Origin`/`Referer` MAY be accepted** for server-to-server/internal integration according to current implementation.
+- **Untrusted explicit `Origin`/`Referer` MUST return `403 Forbidden`** with error code `ORIGIN_NOT_ALLOWED`:
   ```json
   HTTP/1.1 403 Forbidden
   {
@@ -68,7 +70,7 @@ Tracks visitor behavioral and funnel conversion events. Injects multi-touch attr
 | Header | Type | Required | Description |
 |---|---|---|---|
 | `Content-Type` | string | Yes | `application/json` |
-| `Origin` / `Referer` | string | Yes | Must match registered project or landing page domain |
+| `Origin` / `Referer` | string | Conditional | Browser production requests SHOULD provide `Origin` or `Referer`. If present, validated against `project.allowedDomains` and `landingPage.url`. Untrusted origins return 403 `ORIGIN_NOT_ALLOWED`. |
 
 #### Request Payload
 ```json
@@ -141,6 +143,7 @@ Captures consultation requests, sample registrations, and lead forms. Automatica
 |---|---|---|---|
 | `Content-Type` | string | Yes | `application/json` |
 | `X-Idempotency-Key` | string | No | Optional HTTP header alternative to payload key |
+| `Origin` / `Referer` | string | Conditional | Browser production requests SHOULD provide `Origin` or `Referer`. If present, validated against `project.allowedDomains` and `landingPage.url`. Untrusted origins return 403 `ORIGIN_NOT_ALLOWED`. |
 
 #### Request Payload
 ```json
@@ -208,6 +211,7 @@ Captures direct purchase orders, pre-orders, and COD submissions. Automatically 
 |---|---|---|---|
 | `Content-Type` | string | Yes | `application/json` |
 | `X-Idempotency-Key` | string | No | Optional HTTP header alternative to payload key |
+| `Origin` / `Referer` | string | Conditional | Browser production requests SHOULD provide `Origin` or `Referer`. If present, validated against `project.allowedDomains` and `landingPage.url`. Untrusted origins return 403 `ORIGIN_NOT_ALLOWED`. |
 
 #### Request Payload
 ```json
@@ -305,6 +309,13 @@ The stored record contains:
 
 ### 2.4. `POST /api/custom-form`
 Captures flexible key-value data from quizzes, surveys, and multi-step calculators.
+
+#### Request Headers
+| Header | Type | Required | Description |
+|---|---|---|---|
+| `Content-Type` | string | Yes | `application/json` |
+| `X-Idempotency-Key` | string | No | Optional HTTP header alternative to payload key |
+| `Origin` / `Referer` | string | Conditional | Browser production requests SHOULD provide `Origin` or `Referer`. If present, validated against `project.allowedDomains` and `landingPage.url`. Untrusted origins return 403 `ORIGIN_NOT_ALLOWED`. |
 
 #### Request Payload
 ```json

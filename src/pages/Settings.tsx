@@ -130,7 +130,7 @@ LPHub.submitOrder({
         </div>
 
         <p className="text-xs text-slate-600 leading-relaxed">
-          Landing Hub SDK là thư viện JavaScript thuần (Vanilla JS), độc lập framework và siêu nhẹ (&lt; 5KB).
+          Landing Hub SDK là lightweight, zero-dependency browser SDK (Vanilla JavaScript thuần, độc lập framework).
           Tương thích với mọi landing page dựng bằng <strong>Figma to HTML</strong>, <strong>Google Stitch</strong>, <strong>Webflow</strong>, <strong>React</strong>, <strong>Vue</strong> hoặc code tay.
         </p>
 

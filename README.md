@@ -112,7 +112,7 @@ Server API lắng nghe tại port `3001` (hoặc deploy dưới dạng Firebase 
 
 ## 5. Landing Hub SDK
 
-SDK độc lập, siêu nhẹ (< 5KB), không phụ thuộc framework, tự động quản lý:
+Lightweight, zero-dependency browser SDK, tự động quản lý:
 - `firstTouch` & `lastTouch` attribution (`utm_*`, `referrer`)
 - `visitorId` ẩn danh (lưu trong `localStorage['_lphub_vid']`)
 - `sessionId` (lưu trong `sessionStorage['_lphub_sid']`)

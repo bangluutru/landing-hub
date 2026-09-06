@@ -200,13 +200,12 @@ Kiểm chứng tự động toàn bộ 23 kịch bản:
 
 ---
 
-## 7. Landing Hub Integration
-
-All landing pages integrated with Landing Hub must comply with Integration Contract v1.0.
-
-- **Normative Contract Specification**: [docs/INTEGRATION-CONTRACT-v1.md](docs/INTEGRATION-CONTRACT-v1.md)
-- **Technical API Reference**: [docs/API-REFERENCE-v1.md](docs/API-REFERENCE-v1.md)
-- **Archived Draft**: [docs/INTEGRATION-CONTRACT-DRAFT.md](docs/INTEGRATION-CONTRACT-DRAFT.md) (Superseded by v1.0)
+## 7. Landing Hub Integration Contract
+ 
+Tài liệu đặc tả hợp đồng tích hợp chuẩn cho landing page:
+ 
+- **Đặc tả hợp đồng**: [docs/INTEGRATION-CONTRACT-DRAFT.md](docs/INTEGRATION-CONTRACT-DRAFT.md) (`Draft 0.9 — Not Frozen`)
+- **Tài liệu API chi tiết**: [docs/API-REFERENCE.md](docs/API-REFERENCE.md) (`Draft 0.9 Technical Reference`)
 
 ---
 

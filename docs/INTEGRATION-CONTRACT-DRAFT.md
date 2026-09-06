@@ -1,11 +1,10 @@
-# [ARCHIVED] Landing Hub Integration Contract (Draft Specification)
+# AIWF Landing Hub Integration Contract (Draft Specification)
 
-> **ARCHIVE NOTICE**: This draft specification is **SUPERSEDED** by:
-> - [Landing Hub Integration Contract v1.0 (Frozen Specification)](INTEGRATION-CONTRACT-v1.md)
-> - [Landing Hub API Reference v1.0 (Technical Reference)](API-REFERENCE-v1.md)
+> **Contract Status**: `Draft 0.9 — Not Frozen`  
+> **Target Release**: AIWF Landing Hub Integration Contract v1.0  
+> **Technical Reference**: [Landing Hub API Reference (Draft 0.9)](API-REFERENCE.md)  
 >
-> **Status**: `Archived / Superseded by Landing Hub Integration Contract v1.0`  
-> It is retained solely for historical audit purposes. Do not use this document for new integrations.
+> **Notice**: This document specifies the canonical schemas, hierarchy invariants, atomic idempotency protocols, and API contracts implemented in Landing Hub. This specification is currently in **Draft 0.9 (Pre-freeze) status and has NOT yet been frozen into Contract v1.0**.
 
 ---
 

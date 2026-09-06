@@ -1,8 +1,8 @@
 # Landing Hub API Reference
 
-> **API Reference Version**: 1.0  
-> **Status**: Frozen  
-> **Companion Document**: [Landing Hub Integration Contract v1.0](INTEGRATION-CONTRACT-v1.md)
+> **API Reference Version**: 0.9 (Pre-freeze)  
+> **Status**: `Draft 0.9 — Not Frozen`  
+> **Companion Document**: [AIWF Landing Hub Integration Contract (Draft 0.9)](INTEGRATION-CONTRACT-DRAFT.md)  
 
 This document provides the exhaustive technical reference for all public ingestion endpoints, administrative APIs, data schemas, security guardrails, and error responses implemented in Landing Hub.
 

@@ -17,7 +17,7 @@ let adminApp: App;
 if (getApps().length === 0) {
   try {
     adminApp = initializeApp({
-      projectId: process.env.GCLOUD_PROJECT || process.env.FIREBASE_PROJECT_ID || 'landing-hub-aiwf'
+      projectId: process.env.GCLOUD_PROJECT || process.env.FIREBASE_PROJECT_ID || 'landing-hub-4ac12'
     });
   } catch (e) {
     adminApp = initializeApp();

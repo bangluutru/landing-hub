@@ -13,7 +13,7 @@ export const Settings: React.FC = () => {
     setTimeout(() => setCopiedSnippet(null), 2000);
   };
 
-  const cdnCode = `<!-- 1. Nhúng AIWF LP SDK vào Landing Page của bạn -->
+  const cdnCode = `<!-- 1. Nhúng Landing Hub SDK vào Landing Page của bạn -->
 <script src="${window.location.origin}/sdk/lphub.js"></script>`;
 
   const initCode = `// 2. Khởi tạo SDK trong file JS của landing page
@@ -62,7 +62,7 @@ LPHub.submitOrder({
       <div>
         <h2 className="text-lg font-bold text-slate-900">Cài Đặt & Hướng Dẫn Tích Hợp</h2>
         <p className="text-xs text-slate-500 mt-0.5">
-          Tài liệu chuẩn hóa AIWF LP SDK và thông số kỹ thuật cho developer tích hợp
+          Tài liệu chuẩn hóa Landing Hub SDK và thông số kỹ thuật cho developer tích hợp
         </p>
       </div>
 
@@ -126,11 +126,11 @@ LPHub.submitOrder({
       <div className="bg-white rounded-xl border border-slate-200/80 p-6 shadow-xs space-y-6">
         <div className="flex items-center gap-2">
           <BookOpen className="w-4 h-4 text-indigo-600" />
-          <h3 className="text-sm font-bold text-slate-900">Hướng Dẫn Tích Hợp AIWF LP SDK</h3>
+          <h3 className="text-sm font-bold text-slate-900">Hướng Dẫn Tích Hợp Landing Hub SDK</h3>
         </div>
 
         <p className="text-xs text-slate-600 leading-relaxed">
-          AIWF LP SDK là thư viện JavaScript thuần (Vanilla JS), độc lập framework và siêu nhẹ (&lt; 5KB).
+          Landing Hub SDK là thư viện JavaScript thuần (Vanilla JS), độc lập framework và siêu nhẹ (&lt; 5KB).
           Tương thích với mọi landing page dựng bằng <strong>Figma to HTML</strong>, <strong>Google Stitch</strong>, <strong>Webflow</strong>, <strong>React</strong>, <strong>Vue</strong> hoặc code tay.
         </p>
 

@@ -1,8 +1,11 @@
-# AIWF Landing Hub Integration Contract
+# [ARCHIVED] Landing Hub Integration Contract (Draft Specification)
 
-> **Contract Status**: `Draft 0.9 — Not Frozen`  
-> **Target Audience**: AI Workforce Development Teams, Landing Page Creators (Figma / Stitch / Custom HTML / Next.js / Vite), and Backend Integrators.  
-> **Scope**: Standardized contract for external event ingestion, conversion capture, idempotency, and admin data management.
+> **ARCHIVE NOTICE**: This draft specification is **SUPERSEDED** by:
+> - [Landing Hub Integration Contract v1.0 (Frozen Specification)](INTEGRATION-CONTRACT-v1.md)
+> - [Landing Hub API Reference v1.0 (Technical Reference)](API-REFERENCE-v1.md)
+>
+> **Status**: `Archived / Superseded by Landing Hub Integration Contract v1.0`  
+> It is retained solely for historical audit purposes. Do not use this document for new integrations.
 
 ---
 

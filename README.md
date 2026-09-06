@@ -1,6 +1,6 @@
-# Landing Hub — AIWF Centralized Landing Page & Conversion Platform
+# Landing Hub — Centralized Landing Page & Conversion Platform
 
-Landing Hub là hệ thống trung tâm quản trị và tiếp nhận dữ liệu (Ingestion API & Admin Platform) cho toàn bộ landing page hiện tại và tương lai của các dự án thuộc AI Workforce (ABANO, Genki Fami, Balancera, Huma Medical, v.v.), bất kể landing page được thiết kế bằng Figma, Google Stitch, Antigravity hay code thuần.
+Landing Hub là hệ thống trung tâm quản trị và tiếp nhận dữ liệu (Ingestion API & Admin Platform) cho toàn bộ landing page hiện tại và tương lai của các dự án (ABANO, Genki Fami, Balancera, Huma Medical, v.v.), bất kể landing page được thiết kế bằng Figma, Google Stitch, Antigravity hay code thuần.
 
 ---
 
@@ -9,7 +9,7 @@ Landing Hub là hệ thống trung tâm quản trị và tiếp nhận dữ li�
 ```
 Landing Pages (Figma / Stitch / HTML / React)
      ↓
-AIWF LP SDK (@aiwf/lp-sdk / lphub.js)
+Landing Hub SDK (lphub.js)
      ↓ (HTTP REST POST with Origin & Idempotency Key)
 Landing Hub Ingestion API (Express / Firebase Cloud Functions)
      ↓ (Firebase Admin SDK / Cloud Firestore)
@@ -110,13 +110,15 @@ Server API lắng nghe tại port `3001` (hoặc deploy dưới dạng Firebase 
 
 ---
 
-## 5. AIWF LP SDK
+## 5. Landing Hub SDK
 
 SDK độc lập, siêu nhẹ (< 5KB), không phụ thuộc framework, tự động quản lý:
 - `firstTouch` & `lastTouch` attribution (`utm_*`, `referrer`)
-- `visitorId` ẩn danh (lưu trong `localStorage`)
-- `sessionId` (lưu trong `sessionStorage`)
-- `idempotencyKey` tự sinh chống duplicate submit
+- `visitorId` ẩn danh (lưu trong `localStorage['_lphub_vid']`)
+- `sessionId` (lưu trong `sessionStorage['_lphub_sid']`)
+- `idempotencyKey` / `submissionId` ổn định theo logical submission
+- In-flight promise deduplication chống double-click
+- Giữ nguyên key khi retry lỗi
 - Default fallback `apiUrl` về domain hiện tại nếu bị bỏ trống
 
 ### Cách nhúng vào Landing Page:
@@ -145,7 +147,7 @@ SDK độc lập, siêu nhẹ (< 5KB), không phụ thuộc framework, tự đ�
     data: { skinType: 'Da nhạy cảm' }
   });
 
-  // 5. Gửi Đơn đặt hàng (Idempotent)
+  // 5. Gửi Đơn đặt hàng (Atomic Idempotent)
   LPHub.submitOrder({
     formId: 'abano-order-form-01',
     customer: {
@@ -179,11 +181,11 @@ npm run dev
 npm run dev:all
 ```
 
-### Chạy bộ Automated Tests (14 test cases):
+### Chạy bộ Automated Tests (23 test cases):
 ```bash
 npm test
 ```
-Kiểm chứng tự động toàn bộ 14 kịch bản:
+Kiểm chứng tự động toàn bộ 23 kịch bản:
 - `valid lead`, `valid order`, `valid custom form`
 - `unknown project`, `wrong landingPage/project relationship`
 - `unknown form`, `wrong form type`, `inactive form`
@@ -192,10 +194,23 @@ Kiểm chứng tự động toàn bộ 14 kịch bản:
 - `unauthorized admin API`, `project_admin accessing another project`
 - `viewer role restriction`
 - `health check`
+- `auth hardening: test token in test env`, `rejection in production mode`, `fail-closed when flag missing`, `valid Firebase ID token verification`
+- `atomic idempotency concurrency (Promise.all race condition)`
+- `SDK double-submit in-flight deduplication`, `retry key reuse on failure`, `session reset on success`, `explicit createSubmission session`
 
 ---
 
-## 7. Deploy Production
+## 7. Landing Hub Integration
+
+All landing pages integrated with Landing Hub must comply with Integration Contract v1.0.
+
+- **Normative Contract Specification**: [docs/INTEGRATION-CONTRACT-v1.md](docs/INTEGRATION-CONTRACT-v1.md)
+- **Technical API Reference**: [docs/API-REFERENCE-v1.md](docs/API-REFERENCE-v1.md)
+- **Archived Draft**: [docs/INTEGRATION-CONTRACT-DRAFT.md](docs/INTEGRATION-CONTRACT-DRAFT.md) (Superseded by v1.0)
+
+---
+
+## 8. Deploy Production
 
 ### Backend Ingestion API & Security Rules:
 ```bash
@@ -211,5 +226,3 @@ firebase deploy --only functions,firestore:rules
 npm run build
 npx wrangler pages deploy dist --project-name=landing-hub
 ```
-
-Tài liệu chi tiết về contract tích hợp được lưu tại [docs/INTEGRATION-CONTRACT-DRAFT.md](docs/INTEGRATION-CONTRACT-DRAFT.md) (Status: `Draft 0.9 — Not Frozen`).
